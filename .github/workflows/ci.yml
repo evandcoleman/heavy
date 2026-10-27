@@ -28,3 +28,10 @@ jobs:
           test "$(heavy sh -c 'echo hi; exit 3' ; echo "rc=$?")" = "$(printf 'hi\nrc=3')"
           heavy --status
           heavy --top --once
+      - name: One-line install (piped, downloads this commit)
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/install.sh" \
+            | HEAVY_REF=${{ github.sha }} PREFIX="$RUNNER_TEMP/pipe" sh
+          cmp "$RUNNER_TEMP/pipe/bin/heavy" bin/heavy
+          cmp "$RUNNER_TEMP/pipe/bin/heavy-top" bin/heavy-top
+          "$RUNNER_TEMP/pipe/bin/heavy" true

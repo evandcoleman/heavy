@@ -57,12 +57,18 @@ the TUI, Python 3.10+. No other dependencies.
 
 ```sh
 brew install parallel            # or: apt install parallel
-git clone https://github.com/evandcoleman/heavy.git
-cd heavy && ./install.sh         # copies into ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/evandcoleman/heavy/main/install.sh | sh
 ```
 
-`./install.sh --link` symlinks instead of copying, so `git pull` updates it.
-Set `PREFIX` to install somewhere else (`PREFIX=/usr/local ./install.sh`).
+That puts `heavy` and `heavy-top` in `~/.local/bin`. Set `PREFIX` to install
+somewhere else (`… | PREFIX=~/tools sh` installs to `~/tools/bin`), or `HEAVY_REF` to pin a tag or commit.
+
+From a clone:
+
+```sh
+git clone https://github.com/evandcoleman/heavy.git
+cd heavy && ./install.sh         # or --link to symlink, so `git pull` updates it
+```
 
 Works on macOS and Linux.
 
