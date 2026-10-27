@@ -1,0 +1,44 @@
+#!/bin/sh
+# heavy: run a CPU-heavy command through a machine-wide queue.
+# Every caller on this host shares one counting semaphore (GNU parallel `sem`),
+# so at most N heavy commands run at once (N = slots); others block until a slot frees.
+# Output, stdin and exit code pass through unchanged.
+#
+# Usage: heavy <cmd> [args...]
+# Status: heavy --status   (lists running holders)
+# TUI:    heavy --top      (live view of slots, holders, waiters, load; see heavy-top)
+# Slots:  ~/.config/heavy/slots (one integer), default 2. Use the same value everywhere.
+
+set -eu
+
+SLOTS_FILE="${HOME}/.config/heavy/slots"
+SEM_ID="heavy"
+
+slots=2
+if [ -r "$SLOTS_FILE" ]; then
+  s=$(tr -dc '0-9' < "$SLOTS_FILE")
+  [ -n "$s" ] && [ "$s" -gt 0 ] && slots=$s
+fi
+
+if [ "${1:-}" = "--top" ]; then
+  shift
+  exec "$(dirname "$(readlink -f "$0")")/heavy-top" "$@"
+fi
+
+if [ "${1:-}" = "--status" ]; then
+  dir="${HOME}/.parallel/semaphores/id-${SEM_ID}"
+  echo "slots: $slots"
+  if [ -d "$dir" ]; then
+    for f in "$dir"/*@*; do
+      [ -e "$f" ] || continue
+      pid=${f##*/}; pid=${pid%%@*}
+      ps -o pid=,etime=,command= -p "$pid" 2>/dev/null | cut -c1-160 || true
+    done
+  fi
+  exit 0
+fi
+
+[ $# -gt 0 ] || { echo "usage: heavy <cmd> [args...] | heavy --status | heavy --top" >&2; exit 2; }
+
+# -u (ungroup): stream output live and keep it if the job is killed.
+exec sem --id "$SEM_ID" -j "$slots" --fg -q -u --will-cite "$@"

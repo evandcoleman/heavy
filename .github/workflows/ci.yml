@@ -1,0 +1,27 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install GNU parallel
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install parallel; else sudo apt-get update && sudo apt-get install -y parallel; fi
+      - name: Unit tests
+        run: python3 tests/test_heavy_top.py
+      - name: Shell syntax
+        run: sh -n bin/heavy && sh -n install.sh
+      - name: Smoke test
+        run: |
+          ./install.sh
+          export PATH="$HOME/.local/bin:$PATH"
+          test "$(heavy sh -c 'echo hi; exit 3' ; echo "rc=$?")" = "$(printf 'hi\nrc=3')"
+          heavy --status
+          heavy --top --once

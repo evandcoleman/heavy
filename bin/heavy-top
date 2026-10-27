@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""heavy-top: live TUI for the machine-wide `heavy` queue.
+
+Shows slot usage, running holders (with CPU of their whole process tree),
+waiting callers, and host load. Stdlib only.
+
+Usage: heavy-top [--once] [--interval SECONDS]
+Keys:  q quit · r refresh now · +/- change refresh interval
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import time
+import tty
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+
+SEM_ID = "heavy"
+SEM_DIR = Path.home() / ".parallel" / "semaphores" / f"id-{SEM_ID}"
+SLOTS_FILE = Path.home() / ".config" / "heavy" / "slots"
+SEM_RE = re.compile(r"^(?:\S*perl\S*\s+)?(?:\S*/)?sem\s+--id\s+" + SEM_ID + r"\s")
+SEM_PREFIX_RE = re.compile(r"^.*?--will-cite\s+")
+HOME = str(Path.home())
+
+# ── data ──────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Proc:
+    pid: int
+    ppid: int
+    cpu: float
+    elapsed: int
+    command: str
+
+
+@dataclass
+class Job:
+    pid: int
+    elapsed: int
+    command: str
+    cwd: str = ""
+    cpu: float = 0.0
+    alive: bool = True
+
+
+@dataclass
+class Snapshot:
+    slots: int
+    running: list[Job] = field(default_factory=list)
+    waiting: list[Job] = field(default_factory=list)
+    load: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    cores: int = 1
+
+
+def parse_etime(s: str) -> int:
+    """ps etime: [[dd-]hh:]mm:ss → seconds."""
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        days = int(d)
+    parts = [int(p) for p in s.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, sec = parts
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+
+def parse_ps(text: str) -> dict[int, Proc]:
+    procs: dict[int, Proc] = {}
+    for line in text.splitlines():
+        f = line.split(None, 4)
+        if len(f) < 5:
+            continue
+        try:
+            p = Proc(int(f[0]), int(f[1]), float(f[2]), parse_etime(f[3]), f[4])
+        except ValueError:
+            continue
+        procs[p.pid] = p
+    return procs
+
+
+def tree_cpu(root: int, procs: dict[int, Proc]) -> float:
+    children: dict[int, list[int]] = {}
+    for p in procs.values():
+        children.setdefault(p.ppid, []).append(p.pid)
+    total, stack, seen = 0.0, [root], set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen or pid not in procs:
+            continue
+        seen.add(pid)
+        total += procs[pid].cpu
+        stack.extend(children.get(pid, []))
+    return total
+
+
+def holder_pids(sem_dir: Path) -> list[int]:
+    if not sem_dir.is_dir():
+        return []
+    out = []
+    for f in sem_dir.iterdir():
+        name = f.name
+        if "@" in name and name.split("@", 1)[0].isdigit():
+            out.append(int(name.split("@", 1)[0]))
+    return out
+
+
+def user_command(sem_cmd: str) -> str:
+    return SEM_PREFIX_RE.sub("", sem_cmd, count=1)
+
+
+def build_snapshot(procs: dict[int, Proc], holders: list[int], slots: int,
+                   load: tuple[float, float, float], cores: int,
+                   cwd_of=lambda pid: "") -> Snapshot:
+    sems = {pid: p for pid, p in procs.items() if SEM_RE.search(p.command)}
+    held = set(holders)
+    running = []
+    for pid in holders:
+        p = procs.get(pid)
+        if p is None:
+            running.append(Job(pid, 0, "(stale slot — process gone)", alive=False))
+        else:
+            started = [c.elapsed for c in procs.values() if c.ppid == pid]
+            running.append(Job(pid, max(started, default=p.elapsed), user_command(p.command),
+                               cwd_of(pid), tree_cpu(pid, procs)))
+    running.sort(key=lambda j: -j.elapsed)
+    waiting = [Job(pid, p.elapsed, user_command(p.command), cwd_of(pid))
+               for pid, p in sems.items() if pid not in held]
+    waiting.sort(key=lambda j: -j.elapsed)
+    return Snapshot(slots, running, waiting, load, cores)
+
+
+# ── system probes (side effects) ─────────────────────────────────────────
+
+_cwd_cache: dict[int, str] = {}
+
+
+def cwd_of(pid: int) -> str:
+    if pid in _cwd_cache:
+        return _cwd_cache[pid]
+    cwd = ""
+    try:
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                             capture_output=True, text=True, timeout=2).stdout
+        for line in out.splitlines():
+            if line.startswith("n"):
+                cwd = line[1:]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _cwd_cache[pid] = cwd
+    return cwd
+
+
+def read_slots() -> int:
+    try:
+        s = "".join(c for c in SLOTS_FILE.read_text() if c.isdigit())
+        return int(s) if s and int(s) > 0 else 2
+    except OSError:
+        return 2
+
+
+def probe() -> Snapshot:
+    ps = subprocess.run(["ps", "-axo", "pid=,ppid=,pcpu=,etime=,command="],
+                        capture_output=True, text=True,
+                        env={**os.environ, "LC_ALL": "C"}).stdout
+    procs = parse_ps(ps)
+    for pid in list(_cwd_cache):
+        if pid not in procs:
+            del _cwd_cache[pid]
+    return build_snapshot(procs, holder_pids(SEM_DIR), read_slots(),
+                          os.getloadavg(), os.cpu_count() or 1, cwd_of)
+
+
+# ── rendering ─────────────────────────────────────────────────────────────
+
+RESET, BOLD, DIM = "\x1b[0m", "\x1b[1m", "\x1b[2m"
+
+
+def rgb(r, g, b):
+    return f"\x1b[38;2;{r};{g};{b}m"
+
+
+GREEN, YELLOW, RED = rgb(120, 220, 140), rgb(240, 200, 90), rgb(240, 100, 100)
+CYAN, GREY, MAUVE = rgb(110, 200, 230), rgb(130, 130, 140), rgb(190, 150, 240)
+SPARK = "▁▂▃▄▅▆▇█"
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def vlen(s: str) -> int:
+    return len(ANSI_RE.sub("", s))
+
+
+def clip(s: str, width: int) -> str:
+    return s if len(s) <= width else s[: max(0, width - 1)] + "…"
+
+
+def lclip(s: str, width: int) -> str:
+    return s if len(s) <= width else "…" + s[len(s) - max(0, width - 1):]
+
+
+def fmt_dur(sec: int) -> str:
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+
+
+def short_path(p: str) -> str:
+    if p == HOME or p.startswith(HOME + "/"):
+        p = "~" + p[len(HOME):]
+    return p
+
+
+def load_color(ratio: float) -> str:
+    return GREEN if ratio < 0.7 else YELLOW if ratio < 1.5 else RED
+
+
+def sparkline(values, top: float) -> str:
+    out = []
+    for v in values:
+        idx = min(len(SPARK) - 1, int(v / top * (len(SPARK) - 1))) if top else 0
+        out.append(load_color(v / top * 2 if top else 0) + SPARK[idx])
+    return "".join(out) + RESET
+
+
+def box(title: str, lines: list[str], width: int, color: str) -> list[str]:
+    inner = width - 4
+    head = f"{color}╭─ {BOLD}{title}{RESET}{color} " + "─" * max(0, width - vlen(title) - 5) + "╮" + RESET
+    body = [f"{color}│{RESET} " + l + " " * max(0, inner - vlen(l)) + f" {color}│{RESET}" for l in lines]
+    foot = f"{color}╰" + "─" * (width - 2) + "╯" + RESET
+    return [head, *body, foot]
+
+
+def render(snap: Snapshot, history, width: int, interval: float, color=True,
+           max_rows: int | None = None) -> str:
+    width = max(50, min(width, 160))
+    inner = width - 4
+    used = len([j for j in snap.running if j.alive])
+    ratio = snap.load[0] / snap.cores
+    lc = load_color(ratio)
+
+    pips = "".join((MAUVE + "●") if i < used else (GREY + "○") for i in range(snap.slots)) + RESET
+    title = f"{BOLD}heavy{RESET} {GREY}queue{RESET}"
+    stats = (f"{pips} {used}/{snap.slots} slots   "
+             f"{GREY}waiting{RESET} {BOLD}{len(snap.waiting)}{RESET}   "
+             f"{GREY}load{RESET} {lc}{snap.load[0]:.1f}{RESET}"
+             f"{GREY}/{snap.load[1]:.1f}/{snap.load[2]:.1f} on {snap.cores} cores{RESET}")
+    clock = GREY + time.strftime("%H:%M:%S %Z") + RESET
+    header = title + " " * max(1, width - vlen(title) - vlen(clock)) + clock
+
+    spark_w = inner - 8
+    hist = list(history)[-spark_w:]
+    top = max([snap.cores * 2.0, *hist]) if hist else snap.cores * 2.0
+    spark = f"{GREY}load {RESET}" + sparkline(hist, top)
+
+    cmd_w = inner - 30
+    run_lines = []
+    for i, j in enumerate(snap.running, 1):
+        if not j.alive:
+            run_lines.append(f"{GREY}{i}  {j.pid:>6}  {j.command}{RESET}")
+            continue
+        cpu_c = load_color(j.cpu / 100 / max(1, snap.cores / 2))
+        run_lines.append(f"{MAUVE}{i}{RESET}  {j.pid:>6}  {CYAN}{fmt_dur(j.elapsed):>7}{RESET}"
+                         f"  {cpu_c}{j.cpu:>5.0f}%{RESET}  {BOLD}{clip(j.command, cmd_w)}{RESET}")
+        if j.cwd:
+            run_lines.append(f"{' ' * 28}{GREY}{lclip(short_path(j.cwd), cmd_w)}{RESET}")
+    for i in range(used, snap.slots):
+        run_lines.append(f"{GREY}{i + 1}  {'—':>6}  free{RESET}")
+
+    groups = []
+    for i, j in enumerate(snap.waiting, 1):
+        g = [f"{YELLOW}{i:>2}{RESET} {j.pid:>6}  {YELLOW}{fmt_dur(j.elapsed):>7}{RESET}"
+             f"  {clip(j.command, cmd_w)}"]
+        if j.cwd:
+            g.append(f"{' ' * 20}{GREY}{lclip(short_path(j.cwd), cmd_w)}{RESET}")
+        groups.append(g)
+    # fixed rows: 5 header + running box (3 + lines) + waiting box frame (3) + footer
+    budget = None if max_rows is None else max(1, max_rows - (12 + len(run_lines)))
+    wait_lines = []
+    for n, g in enumerate(groups):
+        room = None if budget is None else budget - len(wait_lines) - (1 if n < len(groups) - 1 else 0)
+        if room is not None and len(g) > room:
+            wait_lines.append(f"{GREY}+{len(groups) - n} more{RESET}")
+            break
+        wait_lines.extend(g)
+    if not wait_lines:
+        wait_lines = [f"{GREY}nobody waiting{RESET}"]
+
+    rows = [header, "", stats, spark, "",
+            *box("running", [f"{GREY}#     pid  elapsed     cpu  command{RESET}", *run_lines], width, MAUVE),
+            *box("waiting", [f"{GREY} #    pid   waited  command   (sem has no strict FIFO){RESET}", *wait_lines]
+                 , width, YELLOW),
+            f"{GREY}q quit · r refresh · +/- interval ({interval:g}s){RESET}"]
+    out = "\n".join(rows)
+    return out if color else ANSI_RE.sub("", out)
+
+
+# ── main loop ─────────────────────────────────────────────────────────────
+
+
+ENTER_SCREEN, LEAVE_SCREEN = "\x1b[?1049h\x1b[?25l", "\x1b[?25h\x1b[?1049l"
+
+
+def _exit_on_signal(*_):
+    raise SystemExit(0)
+
+
+def run_tui(interval: float) -> None:
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    history: deque[float] = deque(maxlen=400)
+    resized = [True]
+
+    def enter():
+        tty.setcbreak(fd)
+        sys.stdout.write(ENTER_SCREEN)
+        sys.stdout.flush()
+
+    def leave():
+        termios.tcsetattr(fd, termios.TCSAFLUSH, old)
+        sys.stdout.write(LEAVE_SCREEN)
+        sys.stdout.flush()
+
+    def on_tstp(*_):  # Ctrl-Z: restore the terminal before stopping
+        leave()
+        signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTSTP)
+
+    def on_cont(*_):
+        signal.signal(signal.SIGTSTP, on_tstp)
+        enter()
+        resized[0] = True
+
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
+    signal.signal(signal.SIGTERM, _exit_on_signal)
+    signal.signal(signal.SIGHUP, _exit_on_signal)
+    signal.signal(signal.SIGTSTP, on_tstp)
+    signal.signal(signal.SIGCONT, on_cont)
+    try:
+        enter()
+        while True:
+            snap = probe()
+            history.append(snap.load[0])
+            size = shutil.get_terminal_size()
+            frame = render(snap, history, size.columns, interval, max_rows=size.lines)
+            clear = "\x1b[2J" if resized[0] else ""
+            resized[0] = False
+            sys.stdout.write(clear + "\x1b[H" + frame.replace("\n", "\x1b[K\n") + "\x1b[K\x1b[J")
+            sys.stdout.flush()
+            deadline = time.monotonic() + interval
+            while (left := deadline - time.monotonic()) > 0:
+                r, _, _ = select.select([sys.stdin], [], [], left)
+                if not r:
+                    continue
+                data = os.read(fd, 64)  # drain whole escape sequences (arrows, wheel)
+                if not data:
+                    return  # stdin closed
+                if len(data) > 1 and data[0] == 0x1b:
+                    continue  # ignore escape sequences
+                ch = data[:1].decode(errors="ignore")
+                if ch in {"q", "Q", "\x03"}:
+                    return
+                if ch in {"+", "="}:
+                    interval = min(30.0, interval + 1)
+                elif ch in {"-", "_"}:
+                    interval = max(1.0, interval - 1)
+                elif ch != "r":
+                    continue
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for sig in (signal.SIGTSTP, signal.SIGCONT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_DFL)
+        leave()
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="heavy-top", description=__doc__.splitlines()[0])
+    ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    ap.add_argument("--interval", "-n", type=float, default=2.0, help="refresh seconds (default 2)")
+    args = ap.parse_args(argv)
+    if args.once or not sys.stdin.isatty() or not sys.stdout.isatty():
+        snap = probe()
+        print(render(snap, [snap.load[0]], shutil.get_terminal_size().columns,
+                     args.interval, color=sys.stdout.isatty()))
+        return 0
+    run_tui(max(1.0, args.interval))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
