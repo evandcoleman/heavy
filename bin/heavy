@@ -12,6 +12,12 @@
 set -eu
 
 SLOTS_FILE="${HOME}/.config/heavy/slots"
+
+# Pin sem's state dir so every caller shares one queue, whatever PARALLEL_HOME or
+# XDG_CACHE_HOME their environment sets. heavy-top reads the same location.
+PARALLEL_HOME="${HOME}/.parallel"
+export PARALLEL_HOME
+mkdir -p "$PARALLEL_HOME"
 SEM_ID="heavy"
 
 slots=2
@@ -26,7 +32,7 @@ if [ "${1:-}" = "--top" ]; then
 fi
 
 if [ "${1:-}" = "--status" ]; then
-  dir="${HOME}/.parallel/semaphores/id-${SEM_ID}"
+  dir="${PARALLEL_HOME}/semaphores/id-${SEM_ID}"
   echo "slots: $slots"
   if [ -d "$dir" ]; then
     for f in "$dir"/*@*; do

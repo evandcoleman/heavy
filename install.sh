@@ -18,6 +18,7 @@ command -v python3 >/dev/null 2>&1 || echo "note: heavy-top needs python3 (3.10+
 
 mkdir -p "$BIN"
 for f in heavy heavy-top; do
+  rm -f "$BIN/$f"  # also clears a previous --link symlink, which cp would follow
   if [ "${1:-}" = "--link" ]; then
     ln -sf "$SRC/$f" "$BIN/$f"
   else

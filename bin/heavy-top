@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SEM_ID = "heavy"
+# Same location `heavy` pins via PARALLEL_HOME (always ~/.parallel).
 SEM_DIR = Path.home() / ".parallel" / "semaphores" / f"id-{SEM_ID}"
 SLOTS_FILE = Path.home() / ".config" / "heavy" / "slots"
 SEM_RE = re.compile(r"^(?:\S*perl\S*\s+)?(?:\S*/)?sem\s+--id\s+" + SEM_ID + r"\s")

@@ -113,10 +113,12 @@ Add something like this to your agent instructions (`CLAUDE.md`, `AGENTS.md`, â€
 ## How it works
 
 `heavy` is a few lines of POSIX sh around
-`sem --id heavy -j <slots> --fg -u <cmd>`. GNU parallel's `sem` keeps the semaphore
-as lock files in `~/.parallel/semaphores/id-heavy/`, so every process run by the
-same user shares one queue. `-u` streams output live, so it survives if the job is
-killed. A crashed holder's slot is reclaimed the next time someone acquires.
+`sem --id heavy -j <slots> --fg -q -u --will-cite <cmd>`. `-q` keeps your arguments'
+quoting intact, `-u` streams output live (so it survives if the job is killed), and
+`--will-cite` skips GNU parallel's citation prompt. `sem` keeps the semaphore as lock
+files in `~/.parallel/semaphores/id-heavy/`; `heavy` pins `PARALLEL_HOME` to
+`~/.parallel` so every process run by the same user shares one queue, whatever its
+environment. A crashed holder's slot is reclaimed the next time someone acquires.
 
 `heavy-top` reads those lock files to find holders, and the process table to find
 waiters (live `sem --id heavy` processes that don't hold a slot).
