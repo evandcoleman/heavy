@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """heavy-top: live TUI for the machine-wide `heavy` queue.
 
-Shows slot usage, running holders (with CPU of their whole process tree),
-waiting callers, and host load. Stdlib only.
+Shows slot usage, running jobs (with CPU of their whole process tree), the waiting
+queue in order, and host load. Reads $HEAVY_HOME (see heavyq.py). Stdlib only.
 
 Usage: heavy-top [--once] [--interval SECONDS]
-Keys:  q quit · r refresh now · +/- change refresh interval
+Keys:  q quit · r refresh now · [/] change refresh interval
 """
 from __future__ import annotations
 
@@ -28,16 +28,17 @@ import termios
 import time
 import tty
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Literal
 
-SEM_ID = "heavy"
-# Same location `heavy` pins via PARALLEL_HOME (always ~/.parallel).
-SEM_DIR = Path.home() / ".parallel" / "semaphores" / f"id-{SEM_ID}"
-SLOTS_FILE = Path.home() / ".config" / "heavy" / "slots"
-SEM_RE = re.compile(r"^(?:\S*perl\S*\s+)?(?:\S*/)?sem\s+--id\s+" + SEM_ID + r"\s")
-SEM_PREFIX_RE = re.compile(r"^.*?--will-cite\s+")
+sys.dont_write_bytecode = True  # no __pycache__ next to the installed scripts
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import heavyq  # noqa: E402
+
 HOME = str(Path.home())
+IDLE_HINT_SEC = 60
+HOME_ERROR_EXIT = 2
 
 # ── data ──────────────────────────────────────────────────────────────────
 
@@ -51,23 +52,37 @@ class Proc:
     command: str
 
 
-@dataclass
-class Job:
+@dataclass(frozen=True)
+class Row:
+    kind: Literal["run", "wait"]
     pid: int
+    token: float  # started (run) or enqueued (wait): identifies this incarnation of pid
+    cmd: str
+    cwd: str
     elapsed: int
-    command: str
-    cwd: str = ""
-    cpu: float = 0.0
-    alive: bool = True
+    cpu: float
+    tags: tuple[str, ...]
+    rank: int | None  # 1-based queue position; None for running or pending force/cancel
 
 
-@dataclass
+@dataclass(frozen=True)
 class Snapshot:
     slots: int
-    running: list[Job] = field(default_factory=list)
-    waiting: list[Job] = field(default_factory=list)
-    load: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    cores: int = 1
+    held: int
+    forced: int
+    paused: bool
+    running: tuple[Row, ...]
+    waiting: tuple[Row, ...]
+    load: tuple[float, float, float]
+    cores: int
+
+    def rows(self) -> tuple[Row, ...]:
+        """Selection order: running, then waiting."""
+        return self.running + self.waiting
+
+
+EMPTY_STATE = heavyq.QueueState(waiters=(), holders=(), n=heavyq.DEFAULT_SLOTS, held=frozenset(),
+                                paused=False, corrupt=())
 
 
 def parse_etime(s: str) -> int:
@@ -112,86 +127,83 @@ def tree_cpu(root: int, procs: dict[int, Proc]) -> float:
     return total
 
 
-def holder_pids(sem_dir: Path) -> list[int]:
-    if not sem_dir.is_dir():
-        return []
-    out = []
-    for f in sem_dir.iterdir():
-        name = f.name
-        if "@" in name and name.split("@", 1)[0].isdigit():
-            out.append(int(name.split("@", 1)[0]))
-    return out
+def fmt_idle(sec: float) -> str:
+    m = int(sec // 60)
+    return f"{m}m" if m < 60 else f"{m // 60}h{m % 60:02d}m"
 
 
-def user_command(sem_cmd: str) -> str:
-    return SEM_PREFIX_RE.sub("", sem_cmd, count=1)
+def _since(now: float, t: float) -> int:
+    return max(0, int(now - t))  # clamp: an NTP step back must not show negative time
 
 
-def build_snapshot(procs: dict[int, Proc], holders: list[int], slots: int,
-                   load: tuple[float, float, float], cores: int,
-                   cwd_of=lambda pid: "") -> Snapshot:
-    sems = {pid: p for pid, p in procs.items() if SEM_RE.search(p.command)}
-    held = set(holders)
-    running = []
-    for pid in holders:
-        p = procs.get(pid)
-        if p is None:
-            running.append(Job(pid, 0, "(stale slot — process gone)", alive=False))
-        else:
-            started = [c.elapsed for c in procs.values() if c.ppid == pid]
-            running.append(Job(pid, max(started, default=p.elapsed), user_command(p.command),
-                               cwd_of(pid), tree_cpu(pid, procs)))
-    running.sort(key=lambda j: -j.elapsed)
-    waiting = [Job(pid, p.elapsed, user_command(p.command), cwd_of(pid))
-               for pid, p in sems.items() if pid not in held]
-    waiting.sort(key=lambda j: -j.elapsed)
-    return Snapshot(slots, running, waiting, load, cores)
+def _run_row(h: heavyq.Holder, procs: dict[int, Proc], now: float) -> Row:
+    tags = []
+    if h.forced:
+        tags.append("forced")
+    if h.kill:
+        tags.append("killing")
+    if h.last_progress is not None and now - h.last_progress >= IDLE_HINT_SEC:
+        tags.append(f"idle {fmt_idle(now - h.last_progress)}")
+    return Row("run", h.pid, h.started, h.cmd, h.cwd, _since(now, h.started),
+               tree_cpu(h.pid, procs), tuple(tags), None)
+
+
+def _wait_row(w: heavyq.Waiter, rank: int | None, now: float) -> Row:
+    tags = []
+    if w.cancel:
+        tags.append("cancelling")
+    elif w.force:
+        tags.append("forcing")
+    elif w.order < w.enqueued:
+        tags.append("bumped")
+    return Row("wait", w.pid, w.enqueued, w.cmd, w.cwd, _since(now, w.enqueued), 0.0,
+               tuple(tags), rank)
+
+
+def build_snapshot(state: heavyq.QueueState, procs: dict[int, Proc],
+                   load: tuple[float, float, float], cores: int, now: float) -> Snapshot:
+    running = tuple(_run_row(h, procs, now) for h in state.holders)
+    waiting, rank = [], 0
+    for w in state.waiters:  # ranked first, pending force/cancel after (heavyq.read_state)
+        pending = w.force or w.cancel
+        if not pending:
+            rank += 1
+        waiting.append(_wait_row(w, None if pending else rank, now))
+    return Snapshot(slots=state.n, held=len(state.held), forced=sum(h.forced for h in state.holders),
+                    paused=state.paused, running=running, waiting=tuple(waiting),
+                    load=load, cores=cores)
 
 
 # ── system probes (side effects) ─────────────────────────────────────────
 
-_cwd_cache: dict[int, str] = {}
 
-
-def cwd_of(pid: int) -> str:
-    if pid in _cwd_cache:
-        return _cwd_cache[pid]
-    cwd = ""
+def ps_procs() -> dict[int, Proc]:
     try:
-        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-                             capture_output=True, text=True, timeout=2).stdout
-        for line in out.splitlines():
-            if line.startswith("n"):
-                cwd = line[1:]
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,pcpu=,etime=,command="],
+                             capture_output=True, text=True, timeout=10,
+                             env={**os.environ, "LC_ALL": "C"}).stdout
     except (OSError, subprocess.SubprocessError):
-        pass
-    _cwd_cache[pid] = cwd
-    return cwd
+        return {}
+    return parse_ps(out)
 
 
-def read_slots() -> int:
+def probe(store: heavyq.Store, now: float, prev: Snapshot | None = None,
+          ps: Callable[[], dict[int, Proc]] = ps_procs,
+          read: Callable[[heavyq.Store], heavyq.QueueState] = heavyq.read_state,
+          ) -> tuple[Snapshot, tuple[str, ...]]:
+    """Read the queue under its lock, then ps outside it. Busy -> previous snapshot + note."""
+    load, cores = os.getloadavg(), os.cpu_count() or 1
     try:
-        s = "".join(c for c in SLOTS_FILE.read_text() if c.isdigit())
-        return int(s) if s and int(s) > 0 else 2
-    except OSError:
-        return 2
-
-
-def probe() -> Snapshot:
-    ps = subprocess.run(["ps", "-axo", "pid=,ppid=,pcpu=,etime=,command="],
-                        capture_output=True, text=True,
-                        env={**os.environ, "LC_ALL": "C"}).stdout
-    procs = parse_ps(ps)
-    for pid in list(_cwd_cache):
-        if pid not in procs:
-            del _cwd_cache[pid]
-    return build_snapshot(procs, holder_pids(SEM_DIR), read_slots(),
-                          os.getloadavg(), os.cpu_count() or 1, cwd_of)
+        state = read(store)
+    except heavyq.Busy:
+        return (prev or build_snapshot(EMPTY_STATE, {}, load, cores, now)), ("queue busy",)
+    notes = tuple(f"dropped corrupt entry {name}" for name in state.corrupt)
+    return build_snapshot(state, ps(), load, cores, now), notes
 
 
 # ── rendering ─────────────────────────────────────────────────────────────
 
-RESET, BOLD, DIM = "\x1b[0m", "\x1b[1m", "\x1b[2m"
+RESET, BOLD, DIM, REVERSE = "\x1b[0m", "\x1b[1m", "\x1b[2m", "\x1b[7m"
 
 
 def rgb(r, g, b):
@@ -202,6 +214,7 @@ GREEN, YELLOW, RED = rgb(120, 220, 140), rgb(240, 200, 90), rgb(240, 100, 100)
 CYAN, GREY, MAUVE = rgb(110, 200, 230), rgb(130, 130, 140), rgb(190, 150, 240)
 SPARK = "▁▂▃▄▅▆▇█"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+KEYS_HELP = "↑↓ f force · x kill · c cancel · b bump · p pause · +/- slots"
 
 
 def vlen(s: str) -> int:
@@ -248,66 +261,91 @@ def box(title: str, lines: list[str], width: int, color: str) -> list[str]:
     return [head, *body, foot]
 
 
+def _tag_text(r: Row) -> str:
+    return "".join(f" [{t}]" for t in r.tags)
+
+
+def _cmd_cell(r: Row, width: int) -> str:
+    tags = _tag_text(r)
+    return f"{BOLD}{clip(r.cmd, max(8, width - len(tags)))}{RESET}{MAUVE}{tags}{RESET}"
+
+
+def _highlight(line: str, on: bool) -> str:
+    return f"{REVERSE}{ANSI_RE.sub('', line)}{RESET}" if on else line
+
+
+def _run_lines(snap: Snapshot, cmd_w: int, selected) -> list[str]:
+    lines = []
+    for i, r in enumerate(snap.running, 1):
+        cpu_c = load_color(r.cpu / 100 / max(1, snap.cores / 2))
+        first = (f"{MAUVE}{i}{RESET}  {r.pid:>6}  {CYAN}{fmt_dur(r.elapsed):>7}{RESET}"
+                 f"  {cpu_c}{r.cpu:>5.0f}%{RESET}  {_cmd_cell(r, cmd_w)}")
+        lines.append(_highlight(first, selected == ("run", r.pid)))
+        if r.cwd:
+            lines.append(f"{' ' * 28}{GREY}{lclip(short_path(r.cwd), cmd_w)}{RESET}")
+    for i in range(max(0, snap.slots - snap.held)):
+        lines.append(f"{GREY}{len(snap.running) + i + 1}  {'—':>6}  free{RESET}")
+    return lines
+
+
+def _wait_groups(snap: Snapshot, cmd_w: int, selected) -> list[list[str]]:
+    groups = []
+    for r in snap.waiting:
+        rank = f"{r.rank:>2}" if r.rank is not None else " ·"
+        first = (f"{YELLOW}{rank}{RESET} {r.pid:>6}  {YELLOW}{fmt_dur(r.elapsed):>7}{RESET}"
+                 f"  {_cmd_cell(r, cmd_w)}")
+        g = [_highlight(first, selected == ("wait", r.pid))]
+        if r.cwd:
+            g.append(f"{' ' * 20}{GREY}{lclip(short_path(r.cwd), cmd_w)}{RESET}")
+        groups.append(g)
+    return groups
+
+
+def _fit_groups(groups: list[list[str]], budget: int | None) -> list[str]:
+    lines: list[str] = []
+    for n, g in enumerate(groups):
+        room = None if budget is None else budget - len(lines) - (1 if n < len(groups) - 1 else 0)
+        if room is not None and len(g) > room:
+            lines.append(f"{GREY}+{len(groups) - n} more{RESET}")
+            break
+        lines.extend(g)
+    return lines or [f"{GREY}nobody waiting{RESET}"]
+
+
 def render(snap: Snapshot, history, width: int, interval: float, color=True,
-           max_rows: int | None = None) -> str:
+           max_rows: int | None = None, selected: tuple[str, int] | None = None,
+           footer: str | None = None) -> str:
     width = max(50, min(width, 160))
     inner = width - 4
-    used = len([j for j in snap.running if j.alive])
-    ratio = snap.load[0] / snap.cores
-    lc = load_color(ratio)
+    lc = load_color(snap.load[0] / snap.cores)
 
-    pips = "".join((MAUVE + "●") if i < used else (GREY + "○") for i in range(snap.slots)) + RESET
+    pips = "".join((MAUVE + "●") if i < snap.held else (GREY + "○") for i in range(snap.slots)) + RESET
+    forced = f" {MAUVE}+{snap.forced} forced{RESET}" if snap.forced else ""
     title = f"{BOLD}heavy{RESET} {GREY}queue{RESET}"
-    stats = (f"{pips} {used}/{snap.slots} slots   "
+    stats = (f"{pips} {snap.held}/{snap.slots} slots{forced}   "
              f"{GREY}waiting{RESET} {BOLD}{len(snap.waiting)}{RESET}   "
              f"{GREY}load{RESET} {lc}{snap.load[0]:.1f}{RESET}"
              f"{GREY}/{snap.load[1]:.1f}/{snap.load[2]:.1f} on {snap.cores} cores{RESET}")
     clock = GREY + time.strftime("%H:%M:%S %Z") + RESET
     header = title + " " * max(1, width - vlen(title) - vlen(clock)) + clock
+    banner = f"{RED}{BOLD}PAUSED{RESET} {GREY}— new jobs wait; forced jobs still start · p resumes{RESET}" \
+        if snap.paused else ""
 
-    spark_w = inner - 8
-    hist = list(history)[-spark_w:]
+    hist = list(history)[-(inner - 8):]
     top = max([snap.cores * 2.0, *hist]) if hist else snap.cores * 2.0
     spark = f"{GREY}load {RESET}" + sparkline(hist, top)
 
     cmd_w = inner - 30
-    run_lines = []
-    for i, j in enumerate(snap.running, 1):
-        if not j.alive:
-            run_lines.append(f"{GREY}{i}  {j.pid:>6}  {j.command}{RESET}")
-            continue
-        cpu_c = load_color(j.cpu / 100 / max(1, snap.cores / 2))
-        run_lines.append(f"{MAUVE}{i}{RESET}  {j.pid:>6}  {CYAN}{fmt_dur(j.elapsed):>7}{RESET}"
-                         f"  {cpu_c}{j.cpu:>5.0f}%{RESET}  {BOLD}{clip(j.command, cmd_w)}{RESET}")
-        if j.cwd:
-            run_lines.append(f"{' ' * 28}{GREY}{lclip(short_path(j.cwd), cmd_w)}{RESET}")
-    for i in range(used, snap.slots):
-        run_lines.append(f"{GREY}{i + 1}  {'—':>6}  free{RESET}")
-
-    groups = []
-    for i, j in enumerate(snap.waiting, 1):
-        g = [f"{YELLOW}{i:>2}{RESET} {j.pid:>6}  {YELLOW}{fmt_dur(j.elapsed):>7}{RESET}"
-             f"  {clip(j.command, cmd_w)}"]
-        if j.cwd:
-            g.append(f"{' ' * 20}{GREY}{lclip(short_path(j.cwd), cmd_w)}{RESET}")
-        groups.append(g)
+    run_lines = _run_lines(snap, cmd_w, selected)
     # fixed rows: 5 header + running box (3 + lines) + waiting box frame (3) + footer
     budget = None if max_rows is None else max(1, max_rows - (12 + len(run_lines)))
-    wait_lines = []
-    for n, g in enumerate(groups):
-        room = None if budget is None else budget - len(wait_lines) - (1 if n < len(groups) - 1 else 0)
-        if room is not None and len(g) > room:
-            wait_lines.append(f"{GREY}+{len(groups) - n} more{RESET}")
-            break
-        wait_lines.extend(g)
-    if not wait_lines:
-        wait_lines = [f"{GREY}nobody waiting{RESET}"]
+    wait_lines = _fit_groups(_wait_groups(snap, cmd_w, selected), budget)
 
-    rows = [header, "", stats, spark, "",
+    foot = footer if footer is not None else f"{KEYS_HELP} · [/] {interval:g}s · q quit"
+    rows = [header, banner, stats, spark, "",
             *box("running", [f"{GREY}#     pid  elapsed     cpu  command{RESET}", *run_lines], width, MAUVE),
-            *box("waiting", [f"{GREY} #    pid   waited  command   (sem has no strict FIFO){RESET}", *wait_lines]
-                 , width, YELLOW),
-            f"{GREY}q quit · r refresh · +/- interval ({interval:g}s){RESET}"]
+            *box("waiting", [f"{GREY} #    pid   waited  command{RESET}", *wait_lines], width, YELLOW),
+            f"{GREY}{clip(foot, width)}{RESET}"]
     out = "\n".join(rows)
     return out if color else ANSI_RE.sub("", out)
 
@@ -322,11 +360,12 @@ def _exit_on_signal(*_):
     raise SystemExit(0)
 
 
-def run_tui(interval: float) -> None:
+def run_tui(store: heavyq.Store, interval: float) -> None:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     history: deque[float] = deque(maxlen=400)
     resized = [True]
+    snap: Snapshot | None = None
 
     def enter():
         tty.setcbreak(fd)
@@ -356,10 +395,11 @@ def run_tui(interval: float) -> None:
     try:
         enter()
         while True:
-            snap = probe()
+            snap, notes = probe(store, time.time(), snap)
             history.append(snap.load[0])
             size = shutil.get_terminal_size()
-            frame = render(snap, history, size.columns, interval, max_rows=size.lines)
+            frame = render(snap, history, size.columns, interval, max_rows=size.lines,
+                           footer=notes[0] if notes else None)
             clear = "\x1b[2J" if resized[0] else ""
             resized[0] = False
             sys.stdout.write(clear + "\x1b[H" + frame.replace("\n", "\x1b[K\n") + "\x1b[K\x1b[J")
@@ -377,9 +417,9 @@ def run_tui(interval: float) -> None:
                 ch = data[:1].decode(errors="ignore")
                 if ch in {"q", "Q", "\x03"}:
                     return
-                if ch in {"+", "="}:
+                if ch == "]":
                     interval = min(30.0, interval + 1)
-                elif ch in {"-", "_"}:
+                elif ch == "[":
                     interval = max(1.0, interval - 1)
                 elif ch != "r":
                     continue
@@ -397,12 +437,19 @@ def main(argv=None) -> int:
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
     ap.add_argument("--interval", "-n", type=float, default=2.0, help="refresh seconds (default 2)")
     args = ap.parse_args(argv)
+    paths = heavyq.Paths.from_env(os.environ)
+    store = heavyq.Store(paths)
+    try:
+        store.ensure()
+    except OSError as e:
+        print(f"heavy: cannot use HEAVY_HOME {paths.home}: {e.strerror or e}", file=sys.stderr)
+        return HOME_ERROR_EXIT
     if args.once or not sys.stdin.isatty() or not sys.stdout.isatty():
-        snap = probe()
+        snap, notes = probe(store, time.time())
         print(render(snap, [snap.load[0]], shutil.get_terminal_size().columns,
-                     args.interval, color=sys.stdout.isatty()))
+                     args.interval, color=sys.stdout.isatty(), footer=notes[0] if notes else None))
         return 0
-    run_tui(max(1.0, args.interval))
+    run_tui(store, max(1.0, args.interval))
     return 0
 
 
