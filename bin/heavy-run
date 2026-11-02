@@ -3,7 +3,7 @@
 
 Passes stdio and the exit code through. Every sample interval it sums the CPU time of
 the job's process tree (descendants of the child plus its process group). It kills the
-job when the tree gains too little CPU over a trailing window (idle) or when the job
+job when the tree gains too little CPU over a trailing window with no new processes appearing (idle) or when the job
 runs past a wall-clock cap. Exit 124 on a kill.
 
 Env (minutes may be fractional; 0 disables the check):
@@ -139,6 +139,11 @@ class Watchdog:
         self._idle_cpu, self._idle_sec, self._max_sec, self._start = idle_cpu, idle_sec, max_sec, start
         self._high: dict[int, float] = {}
         self._history: deque[tuple[float, float]] = deque([(start, 0.0)])
+        # Process churn counts as activity: ps TIME never includes exited children, so a
+        # loop of short-lived processes looks CPU-idle. The first sample's pids count as
+        # present since start; any pid first seen later is a "join" at that time.
+        self._seen: Optional[set[int]] = None
+        self._last_join = start
 
     def observe(self, now: float, samples: Optional[Mapping[int, float]]) -> Decision:
         """samples=None means the sample failed: only the wall cap is judged."""
@@ -146,6 +151,11 @@ class Watchdog:
             return Decision("wallcap")
         if samples is None:
             return Decision("continue")
+        if self._seen is None:
+            self._seen = set(samples)
+        elif not self._seen.issuperset(samples):
+            self._seen.update(samples)
+            self._last_join = now
         for pid, cpu in samples.items():
             self._high[pid] = max(self._high.get(pid, 0.0), cpu)
         total = sum(self._high.values())
@@ -156,7 +166,7 @@ class Watchdog:
         while len(self._history) > 1 and self._history[1][0] <= cutoff:
             self._history.popleft()
         gain = total - self._history[0][1]
-        if gain < self._idle_cpu:
+        if gain < self._idle_cpu and self._last_join <= cutoff:
             return Decision("idle", cpu=gain)
         return Decision("continue")
 

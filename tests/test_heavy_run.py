@@ -110,6 +110,33 @@ class Idle(unittest.TestCase):
         d = dog(idle_min=0)
         self.assertEqual(d.observe(80 * MIN, {1: 0.0}).kind, "continue")
 
+    def test_churn_with_no_visible_cpu_is_not_idle(self):
+        d = dog()
+        for i, t in enumerate(range(30, 3600, 30)):
+            # a new short-lived pid every sample; exited children's CPU never shows up
+            self.assertEqual(d.observe(t, {1: 0.0, 1000 + i: 0.0}).kind, "continue", t)
+
+    def test_initial_sample_pids_are_not_churn(self):
+        d = dog()
+        for t in range(30, 600, 30):
+            d.observe(t, {1: 0.0, 2: 0.0, 3: 0.0})
+        self.assertEqual(d.observe(600, {1: 0.0, 2: 0.0, 3: 0.0}).kind, "idle")
+
+    def test_stable_pid_set_at_low_cpu_is_idle(self):
+        d = dog()
+        for t in range(30, 600, 30):
+            d.observe(t, {1: 0.1 * t / 30, 2: 0.0})
+        self.assertEqual(d.observe(600, {1: 2.0, 2: 0.0}).kind, "idle")
+
+    def test_idle_after_churn_stops_and_a_full_quiet_window_passes(self):
+        d = dog()
+        d.observe(30, {1: 0.0})
+        for i, t in enumerate(range(60, 331, 30)):
+            d.observe(t, {1: 0.0, 1000 + i: 0.0})  # last new pid joins at t=330
+        for t in range(360, 930, 30):
+            self.assertEqual(d.observe(t, {1: 0.0, 1009: 0.0}).kind, "continue", t)
+        self.assertEqual(d.observe(930, {1: 0.0, 1009: 0.0}).kind, "idle")
+
     def test_failed_sample_is_skipped(self):
         d = dog()
         self.assertEqual(d.observe(600, None).kind, "continue")

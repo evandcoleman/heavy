@@ -101,7 +101,8 @@ A hung job would hold its slot forever, so `heavy-run` (started by `heavy` once 
 is held) watches every job and kills it when either limit trips:
 
 - **Idle:** the job's process tree gained less than `HEAVY_IDLE_CPU` CPU-seconds
-  (default `5`) over the last `HEAVY_IDLE_MIN` minutes (default `10`).
+  (default `5`) over the last `HEAVY_IDLE_MIN` minutes (default `10`), and no new
+  process joined the tree in that window.
 - **Wall cap:** the job has held its slot longer than `HEAVY_MAX_MIN` minutes
   (default `90`).
 
@@ -112,6 +113,11 @@ warn on stderr and fall back to the default. Per call: `HEAVY_IDLE_MIN=0 heavy <
 A kill sends SIGTERM to the job's process group and tracked descendants, SIGKILL after
 10s, prints one line to stderr naming the limit that tripped, and exits `124`. Otherwise
 the exit code is the job's own (`128+signal` if it died by signal).
+
+Caveat: `ps` doesn't count the CPU of exited children, so a loop of short-lived
+processes (bats, CLI test loops) looks CPU-idle. New processes appearing therefore count
+as activity, which means a hung job that keeps spawning processes is never idle-killed;
+only the wall cap catches it.
 
 Caveat: the job tree is the launcher's descendants plus its process group. A process
 reparented to init/launchd outside that group (for example a macOS XCTest app host) is
