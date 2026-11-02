@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""heavy-run: run a command and kill it if it hangs. Started by `heavy` once a slot is held.
+"""heavy-run: queue for a slot, then run a command and kill it if it hangs.
+
+`heavy` execs this. It joins the machine-wide queue in $HEAVY_HOME (see heavyq.py) and
+waits for a slot (exit 125 if cancelled from heavy-top; 128+signal on Ctrl-C/TERM/HUP).
+Once admitted it runs the command; the watchdog clock starts at admission.
 
 Passes stdio and the exit code through. Every sample interval it sums the CPU time of
 the job's process tree (descendants of the child plus its process group). It kills the
 job when the tree gains too little CPU over a trailing window with no new processes appearing (idle) or when the job
-runs past a wall-clock cap. Exit 124 on a kill.
+runs past a wall-clock cap. Exit 124 on a kill; 143 when killed from heavy-top.
 
 Env (minutes may be fractional; 0 disables the check):
   HEAVY_IDLE_MIN   idle window in minutes, default 10
@@ -14,15 +18,29 @@ Env (minutes may be fractional; 0 disables the check):
 
 Stdlib only, Python 3.10+.
 """
+from __future__ import annotations
+
+import sys
+
+# Keep everything above this guard parseable by old Pythons (macOS /usr/bin/python3 is 3.9).
+if sys.version_info < (3, 10):
+    sys.stderr.write("heavy: needs python3 >= 3.10 (found %d.%d at %s)\n"
+                     % (sys.version_info[0], sys.version_info[1], sys.executable))
+    sys.exit(2)
+
 import math
 import os
+import shlex
 import signal
 import subprocess
-import sys
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional
+
+sys.dont_write_bytecode = True  # no __pycache__ next to the installed scripts
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import heavyq  # noqa: E402
 
 KILL_EXIT = 124
 TICK_SEC = 0.5  # supervise wait granularity: how fast a heavy-top kill flag is seen
@@ -30,6 +48,10 @@ REMOTE_KILL_EXIT = 143
 REMOTE_KILL_MSG = "heavy: killed from heavy-top"
 TERM_GRACE_SEC = 10.0
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+WAIT_SIGNALS = FORWARDED_SIGNALS
+CANCEL_EXIT = 125
+CANCEL_MSG = "heavy: cancelled from heavy-top"
+HOME_ERROR_EXIT = 2
 
 
 # --- parsing ---------------------------------------------------------------
@@ -289,20 +311,65 @@ def exit_code(returncode: int) -> int:
     return 128 - returncode if returncode < 0 else returncode
 
 
-def main(argv: list[str], env: Mapping[str, str] = os.environ) -> int:
-    if not argv:
-        print("usage: heavy-run <cmd> [args...]", file=sys.stderr)
-        return 2
-    warn = lambda m: print(m, file=sys.stderr)
-    cfg = load_config(env, warn)
+# --- queue ------------------------------------------------------------------
+
+class SignalLatch:
+    """While waiting, a signal is only recorded; the wait loop leaves the queue and exits."""
+
+    def __init__(self, signals=WAIT_SIGNALS):
+        self._signals = signals
+        self._sig: Optional[int] = None
+
+    def install(self) -> None:
+        for sig in self._signals:
+            signal.signal(sig, self._record)
+
+    def _record(self, signum, _frame) -> None:
+        if self._sig is None:
+            self._sig = signum
+
+    def pending(self) -> Optional[int]:
+        return self._sig
+
+
+def wait_for_slot(store: heavyq.Store, me: heavyq.Waiter, *, clock: Callable[[], float],
+                  sleep: Callable[[float], None], pending: Callable[[], Optional[int]],
+                  tick: float = TICK_SEC) -> heavyq.Admitted | heavyq.Cancelled | int:
+    """Poll for admission every tick. Returns Admitted, Cancelled, or a signal number."""
+    while True:
+        sig = pending()
+        if sig:
+            heavyq.leave_queue(store, me.pid)
+            return sig
+        step = heavyq.admit_step(store, me, clock())
+        if not isinstance(step, heavyq.Waiting):
+            return step
+        sleep(tick)
+
+
+def _waiter_for(argv: list[str], clock: Callable[[], float]) -> heavyq.Waiter:
     try:
-        proc = subprocess.Popen(argv, preexec_fn=os.setpgrp)
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    now = clock()
+    return heavyq.Waiter(pid=os.getpid(), cmd=shlex.join(argv), cwd=cwd, enqueued=now, order=now)
+
+
+# --- main ------------------------------------------------------------------
+
+def _run_admitted(argv, cfg, store, holder, latch, *, spawn, clock, mono, killer) -> int:
+    try:
+        proc = spawn(argv, preexec_fn=os.setpgrp)
     except OSError as e:
         print(f"heavy-run: {argv[0]}: {e.strerror}", file=sys.stderr)
         return 127 if isinstance(e, FileNotFoundError) else 126
     pgid = proc.pid
     for sig in FORWARDED_SIGNALS:
         signal.signal(sig, lambda s, _f: _signal_all(s, pgid, ()))
+    late = latch.pending()  # arrived between the post-admission check and the handlers
+    if late:
+        _signal_all(late, pgid, ())
 
     def wait_exit(sec: float) -> Optional[int]:
         try:
@@ -310,15 +377,75 @@ def main(argv: list[str], env: Mapping[str, str] = os.environ) -> int:
         except subprocess.TimeoutExpired:
             return None
 
+    def on_progress(t_mono: float) -> None:
+        try:
+            heavyq.record_progress(store, holder, clock() - (mono() - t_mono))
+        except OSError:
+            pass  # display only
+
     sampler = ps_sampler(proc.pid, pgid)
     kind, value = supervise(
-        cfg, clock=time.monotonic, wait_exit=wait_exit, sampler=sampler,
-        kill=lambda: kill_tree(proc, pgid, list(sampler.last_pids)),
+        cfg, clock=mono, wait_exit=wait_exit, sampler=sampler,
+        kill=lambda: killer(proc, pgid, list(sampler.last_pids)),
+        kill_requested=lambda: heavyq.kill_requested(store, holder.pid),
+        on_progress=on_progress,
     )
+    if kind == "remote":
+        print(value, file=sys.stderr)
+        return REMOTE_KILL_EXIT
     if kind == "killed":
         print(value, file=sys.stderr)
         return KILL_EXIT
     return exit_code(value)
+
+
+def _queue_and_run(argv, cfg, store, *, spawn, clock, mono, sleep, killer) -> int:
+    latch = SignalLatch()
+    latch.install()
+    me = _waiter_for(argv, clock)
+    try:
+        heavyq.enqueue(store, me)
+    except heavyq.Busy:
+        pass  # admit_step re-creates the entry on its first poll
+    got = wait_for_slot(store, me, clock=clock, sleep=sleep, pending=latch.pending)
+    if isinstance(got, int):
+        return 128 + got
+    if isinstance(got, heavyq.Cancelled):
+        print(CANCEL_MSG, file=sys.stderr)
+        return CANCEL_EXIT
+    try:
+        sig = latch.pending()
+        if sig:
+            return 128 + sig
+        return _run_admitted(argv, cfg, store, got.holder, latch,
+                             spawn=spawn, clock=clock, mono=mono, killer=killer)
+    finally:
+        heavyq.finish(store, me.pid)
+        if got.slot_fd is not None:
+            os.close(got.slot_fd)
+
+
+def main(argv: list[str], env: Mapping[str, str] = os.environ, *, spawn=subprocess.Popen,
+         clock: Callable[[], float] = time.time, mono: Callable[[], float] = time.monotonic,
+         sleep: Callable[[float], None] = time.sleep, killer=None) -> int:
+    if not argv:
+        print("usage: heavy-run <cmd> [args...]", file=sys.stderr)
+        return 2
+    warn = lambda m: print(m, file=sys.stderr)
+    cfg = load_config(env, warn)
+    paths = heavyq.Paths.from_env(env)
+    store = heavyq.Store(paths)
+    try:
+        store.ensure()
+        live_fd = store.hold_live(os.getpid())
+    except OSError as e:
+        print(f"heavy: cannot use HEAVY_HOME {paths.home}: {e.strerror or e}", file=sys.stderr)
+        return HOME_ERROR_EXIT
+    try:
+        return _queue_and_run(argv, cfg, store, spawn=spawn, clock=clock, mono=mono, sleep=sleep,
+                              killer=killer or kill_tree)
+    finally:
+        os.close(live_fd)
 
 
 if __name__ == "__main__":

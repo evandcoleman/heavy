@@ -9,6 +9,14 @@ Keys:  q quit · r refresh now · +/- change refresh interval
 """
 from __future__ import annotations
 
+import sys
+
+# Keep everything above this guard parseable by old Pythons (macOS /usr/bin/python3 is 3.9).
+if sys.version_info < (3, 10):
+    sys.stderr.write("heavy: needs python3 >= 3.10 (found %d.%d at %s)\n"
+                     % (sys.version_info[0], sys.version_info[1], sys.executable))
+    sys.exit(2)
+
 import argparse
 import os
 import re
@@ -16,7 +24,6 @@ import select
 import shutil
 import signal
 import subprocess
-import sys
 import termios
 import time
 import tty

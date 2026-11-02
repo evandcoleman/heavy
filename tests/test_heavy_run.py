@@ -1,12 +1,15 @@
-import sys, unittest, importlib.util, importlib.machinery
+import contextlib, fcntl, io, os, shutil, signal, subprocess, sys, tempfile, unittest
+import importlib.util, importlib.machinery
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.dont_write_bytecode = True
 loader = importlib.machinery.SourceFileLoader("hr", str(ROOT / "bin" / "heavy-run"))
 spec = importlib.util.spec_from_loader("hr", loader)
 hr = importlib.util.module_from_spec(spec)
 sys.modules["hr"] = hr
 loader.exec_module(hr)
+q = hr.heavyq
 
 MIN = 60.0
 
@@ -313,6 +316,175 @@ class LastProgress(unittest.TestCase):
         d = dog()
         d.observe(30, None)
         self.assertEqual(d.last_progress, 0.0)
+
+
+class QueueCase(unittest.TestCase):
+    """Temp HEAVY_HOME/HOME, fake time; saves and restores signal handlers main() installs."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.env = {"HOME": str(self.tmp), "HEAVY_HOME": str(self.tmp / "q")}
+        self.paths = q.Paths.from_env(self.env)
+        self.t = [1000.0]
+        self.store = q.Store(self.paths, alive=lambda pid: True,
+                             clock=lambda: self.t[0], sleep=self.advance)
+        self.store.ensure()
+        saved = {s: signal.getsignal(s) for s in hr.WAIT_SIGNALS}
+        self.addCleanup(lambda: [signal.signal(s, h) for s, h in saved.items()])
+
+    def advance(self, sec):
+        self.t[0] += sec
+
+    def hold_slot(self, i):
+        fd = os.open(self.paths.home / "slots" / str(i), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+
+    def me(self, pid=os.getpid()):
+        w = q.Waiter(pid=pid, cmd="job", cwd="/", enqueued=self.t[0], order=self.t[0])
+        q.enqueue(self.store, w)
+        return w
+
+
+class WaitForSlot(QueueCase):
+    def wait(self, me, sleep=None, pending=lambda: None):
+        return hr.wait_for_slot(self.store, me, clock=lambda: self.t[0],
+                                sleep=sleep or self.advance, pending=pending)
+
+    def test_wait_admits_after_slot_frees(self):
+        self.store.set_slots(1)
+        fd = self.hold_slot(0)
+        polls = []
+
+        def sleep(sec):
+            polls.append(sec)
+            self.advance(sec)
+            if len(polls) == 2:
+                os.close(fd)
+
+        got = self.wait(self.me(), sleep=sleep)
+        self.assertIsInstance(got, q.Admitted)
+        os.close(got.slot_fd)
+        self.assertEqual(polls, [hr.TICK_SEC, hr.TICK_SEC])  # admitted on the third poll
+
+    def test_wait_cancel_returns_cancelled_and_removes_entry(self):
+        self.store.set_slots(1)
+        self.addCleanup(os.close, self.hold_slot(0))
+        me = self.me()
+
+        def sleep(sec):
+            q.cancel(self.store, me.pid, me.enqueued)
+
+        self.assertIsInstance(self.wait(me, sleep=sleep), q.Cancelled)
+        self.assertIsNone(self.store.get_waiter(me.pid))
+
+    def test_wait_signal_removes_entry_and_returns_signum(self):
+        self.store.set_slots(1)
+        self.addCleanup(os.close, self.hold_slot(0))
+        me = self.me()
+        sig = []
+        got = self.wait(me, sleep=lambda s: sig.append(signal.SIGINT), pending=lambda: sig[0] if sig else None)
+        self.assertEqual(got, signal.SIGINT)
+        self.assertIsNone(self.store.get_waiter(me.pid))
+
+    def test_wait_paused_keeps_waiting_until_force(self):
+        self.store.set_paused(True)
+        me = self.me()
+        polls = []
+
+        def sleep(sec):
+            polls.append(sec)
+            if len(polls) == 3:
+                q.force(self.store, me.pid, me.enqueued)
+
+        got = self.wait(me, sleep=sleep)
+        self.assertEqual((got.slot_fd, got.holder.forced, len(polls)), (None, True, 3))
+
+
+class FakeProc:
+    pid = 2 ** 22 + 4242  # never signalled: the test injects the killer
+
+    def wait(self, timeout=None):
+        raise subprocess.TimeoutExpired("fake", timeout)
+
+
+class Main(QueueCase):
+    def run_main(self, argv, **kw):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = hr.main(argv, self.env, clock=lambda: self.t[0], mono=lambda: self.t[0],
+                         sleep=self.advance, **kw)
+        return rc, err.getvalue()
+
+    def test_main_uncreatable_home_exits_2_without_spawning(self):
+        (self.tmp / "file").write_text("")
+        self.env["HEAVY_HOME"] = str(self.tmp / "file" / "sub")
+        spawned = []
+        rc, err = self.run_main(["true"], spawn=lambda *a, **k: spawned.append(a))
+        self.assertEqual((rc, spawned), (2, []))
+        self.assertIn("heavy: cannot use HEAVY_HOME", err)
+
+    def test_main_spawn_failure_releases_slot_and_entry(self):
+        def spawn(*a, **k):
+            raise FileNotFoundError(2, "No such file or directory")
+
+        rc, err = self.run_main(["nope-cmd"], spawn=spawn)
+        self.assertEqual(rc, 127)
+        self.assertEqual(os.listdir(self.paths.home / "running"), [])
+        self.assertEqual(os.listdir(self.paths.home / "queue"), [])
+        os.close(self.hold_slot(0))  # lockable again
+
+    def test_main_remote_kill_exit_143(self):
+        killed = []
+
+        def spawn(argv, **kw):
+            self.assertEqual(kw.get("preexec_fn"), os.setpgrp)
+            h = self.store.get_holder(os.getpid())
+            self.assertEqual(q.kill(self.store, h.pid, h.started), "ok")
+            return FakeProc()
+
+        rc, err = self.run_main(["sleep", "30"], spawn=spawn,
+                                killer=lambda proc, pgid, pids: killed.append(pgid))
+        self.assertEqual(rc, 143)
+        self.assertEqual(err.strip(), "heavy: killed from heavy-top")
+        self.assertEqual(killed, [FakeProc.pid])
+        self.assertEqual(os.listdir(self.paths.home / "running"), [])
+
+    def test_main_cancelled_while_waiting_exits_125(self):
+        self.store.set_slots(1)
+        self.addCleanup(os.close, self.hold_slot(0))
+
+        def sleep(sec):
+            w = self.store.get_waiter(os.getpid())
+            q.cancel(self.store, w.pid, w.enqueued)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = hr.main(["true"], self.env, clock=lambda: self.t[0], mono=lambda: self.t[0],
+                         sleep=sleep, spawn=lambda *a, **k: self.fail("spawned"))
+        self.assertEqual((rc, err.getvalue().strip()), (125, "heavy: cancelled from heavy-top"))
+
+
+class VersionGuard(unittest.TestCase):
+    def test_old_python_gets_clear_error(self):
+        old = shutil.which("python3.9") or "/usr/bin/python3"
+        try:
+            ver = subprocess.run([old, "-c", "import sys; print(sys.version_info >= (3, 10))"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+        except OSError:
+            self.skipTest("no old python3 on this host")
+        if ver != "False":
+            self.skipTest("no python3 < 3.10 on this host")
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        for script in ("heavy-run", "heavy-top"):
+            r = subprocess.run([old, str(ROOT / "bin" / script), "true"], capture_output=True, text=True,
+                               env={"HOME": tmp, "HEAVY_HOME": tmp + "/q", "PATH": "/usr/bin:/bin"},
+                               timeout=10)
+            self.assertEqual(r.returncode, 2, (script, r.stderr))
+            self.assertRegex(r.stderr, r"^heavy: needs python3 >= 3\.10 \(found 3\.\d+ at .+\)\n$")
 
 
 if __name__ == "__main__":
