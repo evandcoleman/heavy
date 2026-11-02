@@ -235,5 +235,85 @@ class Supervise(unittest.TestCase):
         self.assertEqual(killed, [600.0])
 
 
+class Tick(unittest.TestCase):
+    """0.5 s supervise ticks: kill flag polling, sample cadence and progress reporting."""
+
+    def seams(self, flag_at=None, sampler=None):
+        t = [10.0]
+        log = {"kill": [], "samples": [], "progress": []}
+
+        def wait_exit(sec):
+            t[0] += sec
+            return None
+
+        def sample():
+            log["samples"].append(t[0])
+            return sampler(t[0]) if sampler else {1: 0.0}
+
+        return t, log, dict(
+            clock=lambda: t[0], wait_exit=wait_exit, sampler=sample,
+            kill=lambda: log["kill"].append(t[0]),
+            kill_requested=lambda: flag_at is not None and t[0] >= flag_at,
+            on_progress=log["progress"].append)
+
+    def test_kill_flag_seen_within_one_tick(self):
+        cfg = hr.Config(5.0, 10.0, 90.0, 30.0)
+        t, log, seams = self.seams(flag_at=20.2)
+        self.assertEqual(hr.supervise(cfg, **seams), ("remote", hr.REMOTE_KILL_MSG))
+        self.assertEqual(len(log["kill"]), 1)
+        self.assertLessEqual(log["kill"][0], 20.5)
+        self.assertGreaterEqual(log["kill"][0], 20.2)
+        self.assertEqual(hr.REMOTE_KILL_MSG, "heavy: killed from heavy-top")
+
+    def test_sampling_cadence_unchanged_by_ticks(self):
+        cfg = hr.Config(5.0, 0.0, 0.0, 30.0)
+        t, log, seams = self.seams(flag_at=100.2)
+        hr.supervise(cfg, **seams)
+        self.assertEqual(log["samples"], [40.0, 70.0, 100.0])
+
+    def test_on_progress_reports_watchdog_last_progress(self):
+        cfg = hr.Config(5.0, 10.0, 0.0, 30.0)
+        # busy until t=70 (well above 5s/600s), flat afterwards
+        t, log, seams = self.seams(flag_at=160.0, sampler=lambda now: {1: min(now, 70.0)})
+        hr.supervise(cfg, **seams)
+        self.assertEqual(log["progress"], [40.0, 70.0, 70.0, 70.0])
+
+
+class LastProgress(unittest.TestCase):
+    def test_starts_at_start(self):
+        self.assertEqual(dog(start=5.0).last_progress, 5.0)
+
+    def test_last_progress_at_join(self):
+        d = dog()
+        d.observe(30, {1: 0.0})
+        d.observe(60, {1: 0.0, 2: 0.0})
+        self.assertEqual(d.last_progress, 60)
+
+    def test_last_progress_at_or_above_kill_rate(self):
+        d = dog()  # rate 5s / 600s; 30 s sample needs 0.25 s gain
+        d.observe(30, {1: 0.25})
+        self.assertEqual(d.last_progress, 30)
+        d.observe(60, {1: 0.5})
+        self.assertEqual(d.last_progress, 60)
+
+    def test_no_progress_below_rate(self):
+        d = dog()
+        d.observe(30, {1: 0.1})
+        d.observe(60, {1: 0.2})
+        self.assertEqual(d.last_progress, 0.0)
+
+    def test_disabled_idle_uses_any_gain(self):
+        d = dog(idle_min=0)
+        d.observe(30, {1: 0.0})
+        self.assertEqual(d.last_progress, 0.0)
+        d.observe(60, {1: 0.01})
+        self.assertEqual(d.last_progress, 60)
+
+    def test_failed_sample_is_not_progress(self):
+        d = dog()
+        d.observe(30, None)
+        self.assertEqual(d.last_progress, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

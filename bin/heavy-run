@@ -25,6 +25,9 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, Optional
 
 KILL_EXIT = 124
+TICK_SEC = 0.5  # supervise wait granularity: how fast a heavy-top kill flag is seen
+REMOTE_KILL_EXIT = 143
+REMOTE_KILL_MSG = "heavy: killed from heavy-top"
 TERM_GRACE_SEC = 10.0
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
@@ -144,6 +147,21 @@ class Watchdog:
         # present since start; any pid first seen later is a "join" at that time.
         self._seen: Optional[set[int]] = None
         self._last_join = start
+        # Last sample that showed progress: a join, or a CPU gain at the rate the idle
+        # check requires (any gain when idle checks are off). Shown by heavy-top.
+        self.last_progress = start
+        self._prev = (start, 0.0)
+
+    def _note_gain(self, now: float, total: float) -> None:
+        prev_t, prev_total = self._prev
+        self._prev = (now, total)
+        gain = total - prev_total
+        if self._idle_sec <= 0 or self._idle_cpu <= 0:
+            progressed = gain > 0
+        else:
+            progressed = gain >= self._idle_cpu * (now - prev_t) / self._idle_sec
+        if progressed:
+            self.last_progress = now
 
     def observe(self, now: float, samples: Optional[Mapping[int, float]]) -> Decision:
         """samples=None means the sample failed: only the wall cap is judged."""
@@ -156,10 +174,12 @@ class Watchdog:
         elif not self._seen.issuperset(samples):
             self._seen.update(samples)
             self._last_join = now
+            self.last_progress = now
         for pid, cpu in samples.items():
             self._high[pid] = max(self._high.get(pid, 0.0), cpu)
         total = sum(self._high.values())
         self._history.append((now, total))
+        self._note_gain(now, total)
         if self._idle_sec <= 0 or now - self._start < self._idle_sec:
             return Decision("continue")
         cutoff = now - self._idle_sec
@@ -183,18 +203,35 @@ def kill_message(d: Decision, cfg: Config) -> str:
 # --- I/O loop --------------------------------------------------------------
 
 def supervise(cfg: Config, *, clock: Callable[[], float], wait_exit: Callable[[float], Optional[int]],
-              sampler: Callable[[], Optional[Mapping[int, float]]], kill: Callable[[], None]):
-    """Poll until the child exits or the watchdog fires.
+              sampler: Callable[[], Optional[Mapping[int, float]]], kill: Callable[[], None],
+              kill_requested: Callable[[], bool] = lambda: False,
+              on_progress: Callable[[float], None] = lambda t: None,
+              tick: float = TICK_SEC):
+    """Poll until the child exits, heavy-top asks for a kill, or the watchdog fires.
 
     wait_exit(sec) blocks up to sec and returns the child's exit code, or None if still
-    running. Returns ("exit", code) or ("killed", message) after calling kill().
+    running. It is called in ticks of at most `tick`, so a kill flag is seen promptly;
+    the tree is sampled every cfg.sample_sec. Returns ("exit", code), or ("remote", msg)
+    / ("killed", msg) after calling kill().
     """
-    dog = Watchdog(cfg.idle_cpu, cfg.idle_min * 60, cfg.max_min * 60, clock())
+    start = clock()
+    dog = Watchdog(cfg.idle_cpu, cfg.idle_min * 60, cfg.max_min * 60, start)
+    next_sample = start + cfg.sample_sec
     while True:
-        code = wait_exit(cfg.sample_sec)
+        code = wait_exit(max(0.0, min(tick, next_sample - clock())))
         if code is not None:
             return "exit", code
-        d = dog.observe(clock(), sampler())
+        if kill_requested():
+            kill()
+            return "remote", REMOTE_KILL_MSG
+        now = clock()
+        if now < next_sample:
+            continue
+        next_sample += cfg.sample_sec
+        if next_sample <= now:  # a slow sample: don't fire a burst to catch up
+            next_sample = now + cfg.sample_sec
+        d = dog.observe(now, sampler())
+        on_progress(dog.last_progress)
         if d.kind != "continue":
             kill()
             return "killed", kill_message(d, cfg)
