@@ -153,7 +153,7 @@ out=$(echo hi | "$heavy" cat); [ "$out" = hi ] || fail "stdin passthrough: $out"
 "$heavy" sh -c 'kill -9 $$'; rc=$?; [ "$rc" -eq 137 ] || fail "signal exit: $rc"
 "$heavy" sh -c "$(gate a)" & A=$!
 until_ "running $A"
-"$heavy" --status | grep -q "^ *$A " || fail "--status misses $A: $("$heavy" --status)"
+"$heavy" --status | grep -q "^ *$A .*while \[" || fail "--status misses $A or its command: $("$heavy" --status)"
 touch "$T/a.go"
 expect_rc "$A" 0 "A"
 

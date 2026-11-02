@@ -39,7 +39,11 @@ if [ "${1:-}" = "--status" ]; then
   for f in "$HEAVY_HOME"/running/[0-9]*.json; do
     [ -e "$f" ] || continue
     pid=${f##*/}; pid=${pid%.json}
-    ps -o pid=,etime=,command= -p "$pid" 2>/dev/null | cut -c1-160 || true
+    line=$(ps -o pid=,etime= -p "$pid" 2>/dev/null) || continue
+    # Show the job (heavy-run's child), not the python interpreter running heavy-run.
+    job=$(pgrep -P "$pid" 2>/dev/null | head -n 1) || true
+    cmd=$(ps -o command= -p "${job:-$pid}" 2>/dev/null) || true
+    printf '%s %s\n' "$line" "$cmd" | cut -c1-160
   done
   exit 0
 fi
