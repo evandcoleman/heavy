@@ -431,3 +431,191 @@ class Store:
             return fd
         os.close(fd)
         return None
+
+
+# --- transactions (each takes the lock itself) -----------------------------
+
+CONTROL_LOCK_SEC = 1.0
+
+
+@dataclass(frozen=True)
+class Admitted:
+    holder: Holder
+    slot_fd: int | None  # None when forced
+
+
+@dataclass(frozen=True)
+class Waiting:
+    rank: int | None  # None when paused or the lock was busy
+
+
+@dataclass(frozen=True)
+class Cancelled:
+    pass
+
+
+Step = Admitted | Waiting | Cancelled
+Outcome = Literal["ok", "gone", "busy"]
+
+
+def enqueue(store: Store, me: Waiter) -> None:
+    """Add me to the queue. Raises Busy; admit_step re-creates the entry anyway."""
+    with store.locked(CONTROL_LOCK_SEC):
+        store.prune()
+        store.put_waiter(me)
+
+
+def admit_step(store: Store, me: Waiter, now: float) -> Step:
+    """One admission poll. Flags (force/cancel/bump) are read from the entry file."""
+    try:
+        with store.locked():
+            store.prune()
+            cur = store.get_waiter(me.pid)
+            if cur is None or cur.enqueued != me.enqueued:
+                store.put_waiter(me)  # self-heal: re-create from memory, same order
+                cur = me
+            waiters = store.waiters()
+            if cur.cancel:
+                store.drop_waiter(me.pid)
+                return Cancelled()
+            n = store.slots()
+            held = frozenset() if cur.force else store.held_slots(n)
+            v = decide(cur, waiters, n, held, store.paused())
+            if v.kind == "wait":
+                return Waiting(v.rank)
+            fd = None if v.kind == "force" else store.take_slot(v.slot)
+            if v.kind == "admit" and fd is None:
+                return Waiting(v.rank)
+            holder = admitted(cur, v, now)
+            try:
+                store.put_holder(holder)
+                store.drop_waiter(me.pid)
+            except BaseException:
+                if fd is not None:
+                    os.close(fd)
+                raise
+            return Admitted(holder, fd)
+    except Busy:
+        return Waiting(None)
+
+
+def _drop_best_effort(store: Store, drop: Callable[[int], None], pid: int) -> None:
+    """Remove our own entry; without the lock if it's busy (the file is ours, removal is atomic)."""
+    try:
+        with store.locked(CONTROL_LOCK_SEC):
+            drop(pid)
+    except Busy:
+        drop(pid)
+
+
+def leave_queue(store: Store, pid: int) -> None:
+    _drop_best_effort(store, store.drop_waiter, pid)
+
+
+def finish(store: Store, pid: int) -> None:
+    """Drop our running entry. The caller closes the slot fd afterwards."""
+    _drop_best_effort(store, store.drop_holder, pid)
+
+
+def record_progress(store: Store, base: Holder, last_progress: float) -> bool:
+    """Merge last_progress into the current entry (keeps a kill flag). False when the lock is busy."""
+    try:
+        with store.locked():
+            cur = store.get_holder(base.pid)
+            if cur is None or cur.started != base.started:
+                cur = base
+            store.put_holder(replace(cur, last_progress=last_progress))
+            return True
+    except Busy:
+        return False
+
+
+def kill_requested(store: Store, pid: int) -> bool:
+    h = store.get_holder(pid)
+    return bool(h and h.kill)
+
+
+# --- controls (heavy-top actions) ------------------------------------------
+
+def _control_waiter(store: Store, pid: int, token: float,
+                    change: Callable[[Waiter, list[Waiter]], Waiter]) -> Outcome:
+    try:
+        with store.locked(CONTROL_LOCK_SEC):
+            store.prune()
+            w = store.get_waiter(pid)
+            if w is None or w.enqueued != token:
+                return "gone"
+            store.put_waiter(change(w, store.waiters()))
+            return "ok"
+    except Busy:
+        return "busy"
+
+
+def force(store: Store, pid: int, token: float) -> Outcome:
+    return _control_waiter(store, pid, token, lambda w, _ws: replace(w, force=True))
+
+
+def cancel(store: Store, pid: int, token: float) -> Outcome:
+    return _control_waiter(store, pid, token, lambda w, _ws: replace(w, cancel=True))
+
+
+def bump(store: Store, pid: int, token: float) -> Outcome:
+    return _control_waiter(store, pid, token, bumped)
+
+
+def kill(store: Store, pid: int, token: float) -> Outcome:
+    """Flag a holder; its own heavy-run kills the job. Never signals anything itself."""
+    try:
+        with store.locked(CONTROL_LOCK_SEC):
+            store.prune()
+            h = store.get_holder(pid)
+            if h is None or h.started != token:
+                return "gone"
+            store.put_holder(replace(h, kill=True))
+            return "ok"
+    except Busy:
+        return "busy"
+
+
+def toggle_pause(store: Store) -> bool | Literal["busy"]:
+    try:
+        with store.locked(CONTROL_LOCK_SEC):
+            on = not store.paused()
+            store.set_paused(on)
+            return on
+    except Busy:
+        return "busy"
+
+
+def change_slots(store: Store, delta: int) -> int | Literal["busy"]:
+    try:
+        with store.locked(CONTROL_LOCK_SEC):
+            n = max(1, store.slots() + delta)
+            store.set_slots(n)
+            return n
+    except Busy:
+        return "busy"
+
+
+@dataclass(frozen=True)
+class QueueState:
+    waiters: tuple[Waiter, ...]  # ranked; pending forced/cancelled after them
+    holders: tuple[Holder, ...]  # by start time
+    n: int
+    held: frozenset[int]
+    paused: bool
+    corrupt: tuple[str, ...]
+
+
+def read_state(store: Store, timeout: float = CONTROL_LOCK_SEC) -> QueueState:
+    """Prune, read and probe in one lock section. Raises Busy."""
+    with store.locked(timeout):
+        corrupt = store.prune()
+        waiters = store.waiters()
+        ranked = rank(waiters)
+        pending = sorted((w for w in waiters if w.force or w.cancel), key=lambda w: (w.order, w.enqueued))
+        n = store.slots()
+        return QueueState(
+            waiters=tuple(ranked + pending),
+            holders=tuple(sorted(store.holders(), key=lambda h: (h.started, h.pid))),
+            n=n, held=store.held_slots(n), paused=store.paused(), corrupt=tuple(corrupt))

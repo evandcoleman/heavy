@@ -322,5 +322,180 @@ class LiveLocks(StoreCase):
         self.assertEqual([w.pid for w in self.store.waiters()], [42])
 
 
+class Transactions(StoreCase):
+    def waiter(self, pid, enqueued, **kw):
+        w = W(pid, enqueued, **kw)
+        self.live.add(pid)
+        q.enqueue(self.store, w)
+        return w
+
+    def test_admit_step_admits_and_moves_entry(self):
+        me = self.waiter(1, 10.0)
+        step = q.admit_step(self.store, me, 20.0)
+        self.assertIsInstance(step, q.Admitted)
+        self.addCleanup(os.close, step.slot_fd)
+        self.assertFalse((self.paths.home / "queue" / "1.json").exists())
+        h = self.store.get_holder(1)
+        self.assertEqual((h.slot, h.started, h.forced), (0, 20.0, False))
+        self.assertEqual(step.holder, h)
+        self.assertEqual(self.store.held_slots(2), frozenset({0}))
+
+    def test_admit_step_waits_behind_earlier_waiter(self):
+        self.store.set_slots(1)
+        self.waiter(1, 10.0)
+        me = self.waiter(2, 11.0)
+        self.assertEqual(q.admit_step(self.store, me, 20.0), q.Waiting(1))
+        self.assertIsNotNone(self.store.get_waiter(2))
+
+    def test_admit_step_self_heals_missing_entry(self):
+        self.store.set_slots(1)
+        self.hold_slot(0)
+        me = self.waiter(1, 10.0, order=5.0)
+        self.store.drop_waiter(1)
+        self.assertEqual(q.admit_step(self.store, me, 20.0), q.Waiting(0))
+        self.assertEqual(self.store.get_waiter(1), me)
+
+    def test_admit_step_cancel_removes_entry(self):
+        me = self.waiter(1, 10.0)
+        self.assertEqual(q.cancel(self.store, 1, 10.0), "ok")
+        self.assertIsInstance(q.admit_step(self.store, me, 20.0), q.Cancelled)
+        self.assertIsNone(self.store.get_waiter(1))
+        self.assertEqual(self.store.holders(), [])
+
+    def test_admit_step_force_admits_without_slot(self):
+        self.store.set_slots(1)
+        self.hold_slot(0)
+        me = self.waiter(1, 10.0)
+        self.assertEqual(q.force(self.store, 1, 10.0), "ok")
+        step = q.admit_step(self.store, me, 20.0)
+        self.assertEqual((step.slot_fd, step.holder.slot, step.holder.forced), (None, None, True))
+
+    def test_admit_step_busy_lock_is_waiting(self):
+        me = self.waiter(1, 10.0)
+        self.hold(self.paths.home / "lock")
+        self.assertEqual(q.admit_step(self.store, me, 20.0), q.Waiting(None))
+
+    def test_admit_step_paused_waits_with_no_rank(self):
+        me = self.waiter(1, 10.0)
+        self.store.set_paused(True)
+        self.assertEqual(q.admit_step(self.store, me, 20.0), q.Waiting(None))
+
+    def test_slot_freed_when_holder_fd_closed(self):
+        self.store.set_slots(1)
+        fd = self.hold_slot(0)
+        me = self.waiter(1, 10.0)
+        self.assertEqual(q.admit_step(self.store, me, 20.0), q.Waiting(0))
+        os.close(fd)
+        step = q.admit_step(self.store, me, 21.0)
+        self.assertIsInstance(step, q.Admitted)
+        os.close(step.slot_fd)
+
+    def test_leave_queue_and_finish(self):
+        me = self.waiter(1, 10.0)
+        q.leave_queue(self.store, 1)
+        self.assertIsNone(self.store.get_waiter(1))
+        self.store.put_holder(H(2, 1.0))
+        q.finish(self.store, 2)
+        self.assertIsNone(self.store.get_holder(2))
+
+    def test_record_progress_preserves_kill_flag(self):
+        self.live.add(1)
+        base = H(1, 50.0)
+        self.store.put_holder(base)
+        self.assertEqual(q.kill(self.store, 1, 50.0), "ok")
+        self.assertTrue(q.record_progress(self.store, base, 70.0))
+        h = self.store.get_holder(1)
+        self.assertEqual((h.kill, h.last_progress), (True, 70.0))
+        self.assertTrue(q.kill_requested(self.store, 1))
+
+    def test_record_progress_recreates_missing_and_reports_busy(self):
+        base = H(1, 50.0)
+        self.assertTrue(q.record_progress(self.store, base, 60.0))
+        self.assertEqual(self.store.get_holder(1).last_progress, 60.0)
+        self.hold(self.paths.home / "lock")
+        self.assertFalse(q.record_progress(self.store, base, 61.0))
+
+    def test_kill_requested_false_without_flag_or_entry(self):
+        self.assertFalse(q.kill_requested(self.store, 1))
+        self.store.put_holder(H(1, 50.0))
+        self.assertFalse(q.kill_requested(self.store, 1))
+
+    def test_controls_on_vanished_entry_are_gone(self):
+        for ctl in (q.force, q.cancel, q.bump, q.kill):
+            self.assertEqual(ctl(self.store, 9, 1.0), "gone", ctl.__name__)
+        self.assertEqual(os.listdir(self.paths.home / "queue"), [])
+        self.assertEqual(os.listdir(self.paths.home / "running"), [])
+
+    def test_controls_token_mismatch_is_gone(self):
+        self.waiter(1, 10.0)
+        self.live.add(2)
+        self.store.put_holder(H(2, 20.0))
+        for ctl in (q.force, q.cancel, q.bump):
+            self.assertEqual(ctl(self.store, 1, 11.0), "gone", ctl.__name__)
+        self.assertEqual(q.kill(self.store, 2, 21.0), "gone")
+        self.assertEqual(self.store.get_waiter(1), W(1, 10.0))
+        self.assertFalse(self.store.get_holder(2).kill)
+
+    def test_controls_on_dead_entry_are_gone(self):
+        self.store.put_waiter(W(1, 10.0))  # pid 1 not live
+        self.assertEqual(q.force(self.store, 1, 10.0), "gone")
+
+    def test_cancel_on_admitted_job_does_not_kill(self):
+        me = self.waiter(1, 10.0)
+        step = q.admit_step(self.store, me, 20.0)
+        self.addCleanup(os.close, step.slot_fd)
+        self.assertEqual(q.cancel(self.store, 1, 10.0), "gone")
+        self.assertFalse(self.store.get_holder(1).kill)
+
+    def test_controls_report_busy(self):
+        self.waiter(1, 10.0)
+        self.hold(self.paths.home / "lock")
+        self.assertEqual(q.force(self.store, 1, 10.0), "busy")
+        self.assertEqual(q.toggle_pause(self.store), "busy")
+        self.assertEqual(q.change_slots(self.store, 1), "busy")
+
+    def test_bump_reorders(self):
+        self.waiter(1, 10.0)
+        self.waiter(2, 11.0)
+        self.waiter(3, 12.0)
+        self.assertEqual(q.bump(self.store, 3, 12.0), "ok")
+        state = q.read_state(self.store)
+        self.assertEqual([w.pid for w in state.waiters], [3, 1, 2])
+        self.assertEqual(self.store.get_waiter(3).order, 9.0)
+
+    def test_toggle_pause(self):
+        self.assertIs(q.toggle_pause(self.store), True)
+        self.assertTrue(self.store.paused())
+        self.assertIs(q.toggle_pause(self.store), False)
+        self.assertFalse(self.store.paused())
+
+    def test_change_slots_floor_one(self):
+        self.assertEqual(q.change_slots(self.store, 1), 3)
+        self.assertEqual(q.change_slots(self.store, -5), 1)
+        self.assertEqual(q.change_slots(self.store, -1), 1)
+        self.assertEqual(self.store.slots(), 1)
+
+    def test_read_state_reports_corrupt_once_per_call(self):
+        self.waiter(1, 10.0)
+        self.waiter(2, 11.0, force=True)
+        self.waiter(3, 12.0)
+        self.live.add(4)
+        self.store.put_holder(H(4, 5.0, slot=None, forced=True))
+        self.hold_slot(1)
+        (self.paths.home / "queue" / "7.json").write_text("garbage")
+        self.store.set_paused(True)
+        st = q.read_state(self.store)
+        self.assertEqual(st.corrupt, ("queue/7.json",))
+        self.assertEqual([w.pid for w in st.waiters], [1, 3, 2])  # forced pending after ranked
+        self.assertEqual([h.pid for h in st.holders], [4])
+        self.assertEqual((st.n, st.held, st.paused), (2, frozenset({1}), True))
+        self.assertEqual(q.read_state(self.store).corrupt, ())
+
+    def test_read_state_busy(self):
+        self.hold(self.paths.home / "lock")
+        with self.assertRaises(q.Busy):
+            q.read_state(self.store, timeout=0.05)
+
+
 if __name__ == "__main__":
     unittest.main()
