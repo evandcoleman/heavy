@@ -481,23 +481,44 @@ class Main(QueueCase):
 
 
 class VersionGuard(unittest.TestCase):
-    def test_old_python_gets_clear_error(self):
-        old = shutil.which("python3.9") or "/usr/bin/python3"
+    """On a python < 3.10 the scripts re-exec under a newer one, or fail closed with a hint."""
+
+    def setUp(self):
+        self.old = shutil.which("python3.9") or "/usr/bin/python3"
         try:
-            ver = subprocess.run([old, "-c", "import sys; print(sys.version_info >= (3, 10))"],
+            ver = subprocess.run([self.old, "-c", "import sys; print(sys.version_info >= (3, 10))"],
                                  capture_output=True, text=True, timeout=10).stdout.strip()
         except OSError:
             self.skipTest("no old python3 on this host")
         if ver != "False":
             self.skipTest("no python3 < 3.10 on this host")
-        tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, tmp)
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def run_script(self, script, args, **env):
+        e = {"HOME": self.tmp, "HEAVY_HOME": self.tmp + "/q", "PATH": "/usr/bin:/bin", **env}
+        return subprocess.run([self.old, str(ROOT / "bin" / script), *args], capture_output=True,
+                              text=True, env=e, timeout=30)
+
+    def test_reexecs_under_heavy_python(self):
+        r = self.run_script("heavy-run", ["sh", "-c", "exit 3"], HEAVY_PYTHON=sys.executable)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        r = self.run_script("heavy-top", ["--once"], HEAVY_PYTHON=sys.executable)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("needs python3", r.stderr)
+        self.assertTrue(r.stdout.strip())
+
+    def test_reexec_does_not_loop(self):
+        r = self.run_script("heavy-run", ["true"], HEAVY_PYTHON=self.old, HEAVY_REEXEC="1",
+                            HEAVY_PYTHON_CANDIDATES="")
+        self.assertEqual(r.returncode, 2, r.stderr)
+
+    def test_no_suitable_python_gets_clear_error_and_hint(self):
         for script in ("heavy-run", "heavy-top"):
-            r = subprocess.run([old, str(ROOT / "bin" / script), "true"], capture_output=True, text=True,
-                               env={"HOME": tmp, "HEAVY_HOME": tmp + "/q", "PATH": "/usr/bin:/bin"},
-                               timeout=10)
+            r = self.run_script(script, ["true"], HEAVY_PYTHON_CANDIDATES=self.tmp + "/missing")
             self.assertEqual(r.returncode, 2, (script, r.stderr))
-            self.assertRegex(r.stderr, r"^heavy: needs python3 >= 3\.10 \(found 3\.\d+ at .+\)\n$")
+            self.assertRegex(r.stderr, r"^heavy: needs python3 >= 3\.10 \(found 3\.\d+ at .+\)"
+                                       r" \u2014 set HEAVY_PYTHON to a python3 >= 3\.10\n$")
 
 
 if __name__ == "__main__":

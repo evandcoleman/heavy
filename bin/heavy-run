@@ -23,10 +23,44 @@ from __future__ import annotations
 import sys
 
 # Keep everything above this guard parseable by old Pythons (macOS /usr/bin/python3 is 3.9).
-if sys.version_info < (3, 10):
-    sys.stderr.write("heavy: needs python3 >= 3.10 (found %d.%d at %s)\n"
+# Too old? Re-exec under a newer python3 (so `ssh host heavy` works with a bare PATH).
+# Candidates: $HEAVY_PYTHON, python3.20..python3.10 on PATH, then well-known absolute paths.
+# $HEAVY_PYTHON_CANDIDATES (os.pathsep-separated) replaces the last two groups; test seam.
+def _reexec_or_exit():
+    import os
+    import shutil
+    import subprocess
+    here = os.path.realpath(sys.executable or "")
+    if not os.environ.get("HEAVY_REEXEC"):
+        override = os.environ.get("HEAVY_PYTHON_CANDIDATES")
+        if override is not None:
+            cands = [c for c in override.split(os.pathsep) if c]
+        else:
+            cands = [shutil.which("python3.%d" % n) for n in range(20, 9, -1)] + [
+                "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                "/home/linuxbrew/.linuxbrew/bin/python3", "/usr/bin/python3"]
+        cands = [os.environ.get("HEAVY_PYTHON")] + cands
+        for cand in cands:
+            if not cand or not os.access(cand, os.X_OK) or os.path.realpath(cand) == here:
+                continue
+            try:
+                ok = subprocess.run(
+                    [cand, "-c", "import sys; print(sys.version_info[:2] >= (3,10))"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
+                    universal_newlines=True).stdout.strip() == "True"
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if ok:
+                os.environ["HEAVY_REEXEC"] = "1"
+                os.execv(cand, [cand, os.path.realpath(__file__)] + sys.argv[1:])
+    sys.stderr.write("heavy: needs python3 >= 3.10 (found %d.%d at %s)"
+                     " — set HEAVY_PYTHON to a python3 >= 3.10\n"
                      % (sys.version_info[0], sys.version_info[1], sys.executable))
     sys.exit(2)
+
+
+if sys.version_info < (3, 10):
+    _reexec_or_exit()
 
 import math
 import os

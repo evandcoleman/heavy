@@ -88,8 +88,10 @@ git clone https://github.com/evandcoleman/heavy.git
 cd heavy && ./install.sh         # or --link to symlink, so `git pull` updates it
 ```
 
-Works on macOS and Linux. On macOS, `/usr/bin/python3` is 3.9: `heavy` then exits `2`
-with `heavy: needs python3 >= 3.10`, so make sure a newer `python3` comes first on `PATH`.
+Works on macOS and Linux. If the `python3` on `PATH` is older than 3.10 (macOS's `/usr/bin/python3` is 3.9,
+and non-interactive `ssh host heavy` has no Homebrew on `PATH`), `heavy` re-execs under the first suitable
+interpreter it finds: `$HEAVY_PYTHON`, then `python3.20`…`python3.10` on `PATH`, then Homebrew and system
+locations. Set `HEAVY_PYTHON` to pin one; with none found it exits `2` with `heavy: needs python3 >= 3.10`.
 
 ### Upgrading from the GNU parallel version
 
