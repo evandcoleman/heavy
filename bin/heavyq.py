@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Literal, Mapping, Sequence
 
 DEFAULT_SLOTS = 2
 POLL_SEC = 0.5
@@ -139,3 +139,52 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 def atomic_write_json(path: Path, obj: dict) -> None:
     atomic_write_text(path, json.dumps(obj, sort_keys=True) + "\n")
+
+
+# --- pure ranking and admission --------------------------------------------
+
+def rank(waiters: Iterable[Waiter]) -> list[Waiter]:
+    """Waiters competing for a slot, in queue order. Forced/cancelled ones don't take a rank."""
+    eligible = [w for w in waiters if not w.force and not w.cancel]
+    return sorted(eligible, key=lambda w: (w.order, w.enqueued, w.pid))
+
+
+def free_slots(n: int, held: frozenset[int]) -> list[int]:
+    """Admittable slot indices. A held index >= n (slots shrank) still uses up capacity."""
+    free = [i for i in range(n) if i not in held]
+    overflow = sum(1 for i in held if i >= n)
+    return free[:max(0, len(free) - overflow)]
+
+
+@dataclass(frozen=True)
+class Verdict:
+    kind: Literal["cancel", "force", "admit", "wait"]
+    slot: int | None = None
+    rank: int | None = None
+
+
+def decide(me: Waiter, waiters: Sequence[Waiter], n: int,
+           held: frozenset[int], paused: bool) -> Verdict:
+    if me.cancel:
+        return Verdict("cancel")
+    if me.force:
+        return Verdict("force")
+    if paused:
+        return Verdict("wait")
+    ranked = rank([w for w in waiters if w.pid != me.pid] + [me])
+    my_rank = next(i for i, w in enumerate(ranked) if w.pid == me.pid)
+    free = free_slots(n, held)
+    if my_rank < len(free):
+        return Verdict("admit", slot=free[0], rank=my_rank)
+    return Verdict("wait", rank=my_rank)
+
+
+def admitted(me: Waiter, v: Verdict, now: float) -> Holder:
+    forced = v.kind == "force"
+    return Holder(pid=me.pid, cmd=me.cmd, cwd=me.cwd, started=now,
+                  slot=None if forced else v.slot, forced=forced)
+
+
+def bumped(target: Waiter, waiters: Sequence[Waiter]) -> Waiter:
+    lowest = min([w.order for w in waiters] + [target.order])
+    return replace(target, order=lowest - 1)

@@ -93,5 +93,65 @@ class AtomicWrite(TempHome):
         self.assertEqual(sorted(os.listdir(self.tmp)), ["a.json"])
 
 
+class Decide(unittest.TestCase):
+    def test_fifo_head_admitted_when_one_free(self):
+        ws = [W(3, 30.0), W(1, 10.0), W(2, 20.0)]
+        self.assertEqual(q.decide(ws[1], ws, 1, frozenset(), False), q.Verdict("admit", slot=0, rank=0))
+        self.assertEqual(q.decide(ws[2], ws, 1, frozenset(), False), q.Verdict("wait", rank=1))
+        self.assertEqual(q.decide(ws[0], ws, 1, frozenset(), False), q.Verdict("wait", rank=2))
+
+    def test_two_free_admits_ranks_0_and_1(self):
+        ws = [W(1, 10.0), W(2, 20.0), W(3, 30.0)]
+        self.assertEqual(q.decide(ws[1], ws, 2, frozenset(), False).kind, "admit")
+        self.assertEqual(q.decide(ws[2], ws, 2, frozenset(), False).kind, "wait")
+
+    def test_bump_moves_to_front(self):
+        ws = [W(1, 10.0), W(2, 20.0), W(3, 30.0)]
+        b = q.bumped(ws[2], ws)
+        self.assertEqual(b.order, 9.0)
+        self.assertEqual(b.enqueued, 30.0)
+        ranked = q.rank([ws[0], ws[1], b])
+        self.assertEqual([w.pid for w in ranked], [3, 1, 2])
+        self.assertEqual(q.bumped(ws[0], ws).order, 9.0)  # head bump still lowers order
+
+    def test_force_admits_without_slot_even_when_full_and_paused(self):
+        me = W(2, 20.0, force=True)
+        ws = [W(1, 10.0), me]
+        v = q.decide(me, ws, 1, frozenset({0}), True)
+        self.assertEqual(v, q.Verdict("force"))
+        h = q.admitted(me, v, 50.0)
+        self.assertEqual((h.slot, h.forced, h.started, h.pid, h.cmd), (None, True, 50.0, 2, "job2"))
+
+    def test_forced_and_cancelled_waiters_do_not_take_rank(self):
+        ws = [W(1, 10.0, force=True), W(2, 20.0, cancel=True), W(3, 30.0)]
+        self.assertEqual([w.pid for w in q.rank(ws)], [3])
+        self.assertEqual(q.decide(ws[2], ws, 1, frozenset(), False).kind, "admit")
+
+    def test_cancel_wins_over_force(self):
+        me = W(1, 10.0, force=True, cancel=True)
+        self.assertEqual(q.decide(me, [me], 1, frozenset(), False).kind, "cancel")
+
+    def test_paused_blocks_non_forced(self):
+        me = W(1, 10.0)
+        self.assertEqual(q.decide(me, [me], 2, frozenset(), True), q.Verdict("wait", rank=None))
+
+    def test_shrink_overflow_counts_as_held(self):
+        self.assertEqual(q.free_slots(2, frozenset({1, 2})), [])
+        self.assertEqual(q.free_slots(1, frozenset({0, 1})), [])
+        self.assertEqual(q.free_slots(3, frozenset({3})), [0, 1])
+        self.assertEqual(q.free_slots(2, frozenset({5, 6})), [])
+
+    def test_admit_takes_lowest_free_index(self):
+        me = W(1, 10.0)
+        v = q.decide(me, [me], 3, frozenset({0}), False)
+        self.assertEqual(v, q.Verdict("admit", slot=1, rank=0))
+        h = q.admitted(me, v, 11.0)
+        self.assertEqual((h.slot, h.forced), (1, False))
+
+    def test_decide_counts_me_even_if_missing_from_list(self):
+        me = W(2, 20.0)
+        self.assertEqual(q.decide(me, [W(1, 10.0)], 1, frozenset(), False), q.Verdict("wait", rank=1))
+
+
 if __name__ == "__main__":
     unittest.main()
