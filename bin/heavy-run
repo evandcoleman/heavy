@@ -61,6 +61,10 @@ def _reexec_or_exit():
 
 if sys.version_info < (3, 10):
     _reexec_or_exit()
+else:
+    # Version is fine: drop the loop-guard marker so nested heavy invocations in the job can re-exec.
+    import os as _os
+    _os.environ.pop("HEAVY_REEXEC", None)
 
 import math
 import os

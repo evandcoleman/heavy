@@ -508,6 +508,11 @@ class VersionGuard(unittest.TestCase):
         self.assertNotIn("needs python3", r.stderr)
         self.assertTrue(r.stdout.strip())
 
+    def test_reexec_marker_does_not_leak_into_the_job(self):
+        r = self.run_script("heavy-run", ["sh", "-c", 'echo "[${HEAVY_REEXEC-unset}]"'],
+                            HEAVY_PYTHON=sys.executable)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "[unset]"), r.stderr)
+
     def test_reexec_does_not_loop(self):
         r = self.run_script("heavy-run", ["true"], HEAVY_PYTHON=self.old, HEAVY_REEXEC="1",
                             HEAVY_PYTHON_CANDIDATES="")
