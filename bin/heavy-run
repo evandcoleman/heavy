@@ -244,6 +244,7 @@ def supervise(cfg: Config, *, clock: Callable[[], float], wait_exit: Callable[[f
         if code is not None:
             return "exit", code
         if kill_requested():
+            sampler()  # refresh the tracked pids so kill() reaches processes that left the pgrp
             kill()
             return "remote", REMOTE_KILL_MSG
         now = clock()

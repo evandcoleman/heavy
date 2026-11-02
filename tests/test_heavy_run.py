@@ -268,11 +268,24 @@ class Tick(unittest.TestCase):
         self.assertGreaterEqual(log["kill"][0], 20.2)
         self.assertEqual(hr.REMOTE_KILL_MSG, "heavy: killed from heavy-top")
 
+    def test_remote_kill_samples_tree_fresh_before_killing(self):
+        """The kill targets the pids of a sample taken at kill time, not one up to
+        sample_sec old (or none at all within the first sample interval)."""
+        cfg = hr.Config(5.0, 10.0, 90.0, 30.0)
+        events = []
+        t, log, seams = self.seams(flag_at=20.2)
+        sample = seams["sampler"]
+        seams["sampler"] = lambda: (events.append(("sample", t[0])), sample())[1]
+        seams["kill"] = lambda: events.append(("kill", t[0]))
+        self.assertEqual(hr.supervise(cfg, **seams)[0], "remote")
+        self.assertEqual(events, [("sample", 20.5), ("kill", 20.5)])
+
     def test_sampling_cadence_unchanged_by_ticks(self):
         cfg = hr.Config(5.0, 0.0, 0.0, 30.0)
         t, log, seams = self.seams(flag_at=100.2)
         hr.supervise(cfg, **seams)
-        self.assertEqual(log["samples"], [40.0, 70.0, 100.0])
+        # every sample_sec, not every tick; the last one is the fresh sample before the remote kill
+        self.assertEqual(log["samples"], [40.0, 70.0, 100.0, 100.5])
 
     def test_on_progress_reports_watchdog_last_progress(self):
         cfg = hr.Config(5.0, 10.0, 0.0, 30.0)
