@@ -14,17 +14,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install GNU parallel
-        run: |
-          if [ "$RUNNER_OS" = macOS ]; then brew install parallel; else sudo apt-get update && sudo apt-get install -y parallel; fi
       - name: Unit tests
         run: |
+          python3 tests/test_heavyq.py
           python3 tests/test_heavy_top.py
           python3 tests/test_heavy_run.py
-      - name: Watchdog integration test
-        run: sh tests/integration_heavy_run.sh
+      - name: Integration tests
+        run: |
+          sh tests/integration_heavy_run.sh
+          sh tests/integration_queue.sh
       - name: Shell syntax
-        run: sh -n bin/heavy && sh -n install.sh && sh -n tests/integration_heavy_run.sh
+        run: |
+          sh -n bin/heavy && sh -n install.sh
+          sh -n tests/integration_heavy_run.sh && sh -n tests/integration_queue.sh
       - name: Smoke test
         run: |
           ./install.sh
@@ -32,6 +34,14 @@ jobs:
           test "$(heavy sh -c 'echo hi; exit 3' ; echo "rc=$?")" = "$(printf 'hi\nrc=3')"
           heavy --status
           heavy --top --once
+          cmp "$HOME/.local/bin/heavyq.py" bin/heavyq.py
+      - name: Link install
+        run: |
+          PREFIX="$RUNNER_TEMP/link" ./install.sh --link
+          test -L "$RUNNER_TEMP/link/bin/heavy-run"
+          test -L "$RUNNER_TEMP/link/bin/heavyq.py"
+          rc=0; "$RUNNER_TEMP/link/bin/heavy" sh -c 'exit 4' || rc=$?; test "$rc" -eq 4
+          "$RUNNER_TEMP/link/bin/heavy" --top --once
       - name: One-line install (piped, downloads this commit)
         run: |
           curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/install.sh" \
@@ -39,4 +49,5 @@ jobs:
           cmp "$RUNNER_TEMP/pipe/bin/heavy" bin/heavy
           cmp "$RUNNER_TEMP/pipe/bin/heavy-top" bin/heavy-top
           cmp "$RUNNER_TEMP/pipe/bin/heavy-run" bin/heavy-run
+          cmp "$RUNNER_TEMP/pipe/bin/heavyq.py" bin/heavyq.py
           "$RUNNER_TEMP/pipe/bin/heavy" true

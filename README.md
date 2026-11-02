@@ -12,55 +12,73 @@ all decide to run the full test suite, a headless-browser walkthrough and a rele
 build at the same moment. Load goes to 40 on 14 cores, everything slows down,
 timeouts fire, and agents retry, which makes it worse.
 
-`heavy` puts a counting semaphore in front of those commands. Every caller on the
-host shares it, so at most N heavy jobs run at once and the rest wait their turn.
+`heavy` puts a queue in front of those commands. Every caller on the host shares it,
+so at most N heavy jobs run at once and the rest wait their turn, first in, first out.
 Output, stdin and exit codes pass through unchanged, so you can wrap any command
-without changing how you use it.
+without changing how you use it. From `heavy --top` you can force a job past the
+queue, kill one, cancel or bump a waiter, pause the queue and change the slot count.
 
 ## heavy --top
 
 ```
-heavy queue                                                           14:32:07 EDT
+heavy queue                                                             14:32:07 EDT
+PAUSED — new jobs wait; forced jobs still start · p resumes
+●● 2/2 slots +1 forced   waiting 2   load 18.4/15.2/11.9 on 14 cores
+load ▂▂▃▃▄▄▄▅▅
 
-●● 2/2 slots   waiting 2   load 18.4/15.2/11.9 on 14 cores
-load ▂▂▃▄▄▅▅▅▅
-
-╭─ running ──────────────────────────────────────────────────────────────────────╮
-│ #     pid  elapsed     cpu  command                                            │
-│ 1      10   38m12s    360%  npm run test:e2e                                   │
-│                             /home/you/src/web-app                              │
-│ 2      20    3m05s    640%  xcodebuild -scheme App build                       │
-│                             /home/you/src/ios-app                              │
-╰────────────────────────────────────────────────────────────────────────────────╯
-╭─ waiting ──────────────────────────────────────────────────────────────────────╮
-│  #    pid   waited  command   (sem has no strict FIFO)                         │
-│  1     30    2m40s  cargo build --release                                      │
-│                     /home/you/src/engine                                       │
-│  2     31    0m12s  pnpm test                                                  │
-│                     /home/you/src/web-app                                      │
-╰────────────────────────────────────────────────────────────────────────────────╯
-q quit · r refresh · +/- interval (2s)
+╭─ running ────────────────────────────────────────────────────────────────────────╮
+│ #     pid  elapsed     cpu  command                                              │
+│ 1   41210   38m12s    360%  npm run test:e2e                                     │
+│                             ~/src/web-app                                        │
+│ 2   41388   19m45s     12%  xcodebuild -scheme App build [idle 6m]               │
+│                             ~/src/ios-app                                        │
+│ 3   41702    1m04s    540%  cargo test -p parser [forced]                        │
+│                             ~/src/engine                                         │
+╰──────────────────────────────────────────────────────────────────────────────────╯
+╭─ waiting ────────────────────────────────────────────────────────────────────────╮
+│  #    pid   waited  command                                                      │
+│  1  41923    0m12s  pnpm test [bumped]                                           │
+│                     ~/src/web-app                                                │
+│  2  41850    2m40s  cargo build --release                                        │
+│                     ~/src/engine                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────╯
+↑↓ f force · x kill · c cancel · b bump · p pause · +/- slots · [/] 2s · q quit
 ```
 
-- **running**: each slot holder, how long it has had the slot, CPU for its whole
-  process tree (so a test run counts the browsers it spawned), and where it runs.
-- **waiting**: callers blocked on a slot, longest wait first.
+- **running**: each job, how long it has run, CPU for its whole process tree (so a
+  test run counts the browsers it spawned), and where it runs. `[forced]` jobs were
+  started past the queue and don't hold a slot; `[idle 6m]` means the tree has stayed
+  below the watchdog's idle rate for that long.
+- **waiting**: the queue in order (`#` is the position). `[bumped]` jobs were moved to
+  the front.
+- The header shows `held/N slots`, plus `+K forced` when forced jobs oversubscribe the
+  host, and a `PAUSED` banner while the queue is paused.
 - **load**: 1/5/15-minute load against core count, with a history sparkline.
 
-Keys: `q` quit, `r` refresh, `+`/`-` change the refresh interval. `heavy --top
---once` prints a single plain-text snapshot, which is handy for scripts and agents.
+| Key | Action |
+|---|---|
+| `↑`/`↓` or `j`/`k` | select a job (running and waiting) |
+| `f` | force the selected waiter to start now, without a slot |
+| `x` | kill the selected running job (asks `y/n`); it exits `143` |
+| `c` | cancel the selected waiter (asks `y/n`); it exits `125` without running |
+| `b` | bump the selected waiter to the front of the queue |
+| `p` | pause or resume the queue (forced jobs still start) |
+| `+` / `-` | one more or one fewer slot (writes `~/.config/heavy/slots`, minimum 1) |
+| `[` / `]` | shorter or longer refresh interval |
+| `r` / `q` | refresh now / quit |
+
+`heavy --top --once` prints a single plain-text snapshot with the same fields, which is
+handy for scripts and agents.
 
 ## Install
 
-Needs [GNU parallel](https://www.gnu.org/software/parallel/) (for `sem`) and, for
-the TUI, Python 3.10+. No other dependencies.
+Needs Python 3.10+ (stdlib only). No other dependencies.
 
 ```sh
-brew install parallel            # or: apt install parallel
 curl -fsSL https://raw.githubusercontent.com/evandcoleman/heavy/main/install.sh | sh
 ```
 
-That puts `heavy`, `heavy-top` and `heavy-run` in `~/.local/bin`. Set `PREFIX` to install
+That puts `heavy`, `heavy-top`, `heavy-run` and `heavyq.py` in `~/.local/bin`. Set `PREFIX` to install
 somewhere else (`… | PREFIX=~/tools sh` installs to `~/tools/bin`), or `HEAVY_REF` to pin a tag or commit.
 
 From a clone:
@@ -70,15 +88,34 @@ git clone https://github.com/evandcoleman/heavy.git
 cd heavy && ./install.sh         # or --link to symlink, so `git pull` updates it
 ```
 
-Works on macOS and Linux.
+Works on macOS and Linux. On macOS, `/usr/bin/python3` is 3.9: `heavy` then exits `2`
+with `heavy: needs python3 >= 3.10`, so make sure a newer `python3` comes first on `PATH`.
+
+### Upgrading from the GNU parallel version
+
+Earlier versions queued through GNU parallel's `sem`. Jobs already waiting in the old
+`sem` queue still run, but they don't count against the new slots, so the host may be
+oversubscribed for a while after you upgrade. Such a job then joins the new queue too,
+once `sem` lets it through. Afterwards you can delete `~/.parallel` and uninstall GNU
+parallel if nothing else uses it.
 
 ## Usage
 
 ```sh
 heavy <cmd> [args...]     # run cmd once a slot is free
-heavy --status            # list current slot holders
+heavy --status            # list running jobs
 heavy --top [-n SECONDS]  # TUI (alias for heavy-top)
 ```
+
+The exit code is the command's own (`128+signal` if it died by signal), or:
+
+| Code | Meaning |
+|---|---|
+| `124` | killed by the watchdog |
+| `125` | cancelled from `heavy --top` while waiting; the command never ran |
+| `143` | killed from `heavy --top` |
+| `130` / `143` / `129` | Ctrl-C / TERM / HUP while waiting: it leaves the queue, the command never ran |
+| `2` | `$HEAVY_HOME` can't be created or used; the command never runs |
 
 Wrap the expensive things, not everything:
 
@@ -90,20 +127,21 @@ Quick targeted tests and linters don't need it.
 
 ### Slots
 
-The slot count lives in `~/.config/heavy/slots` (a single integer, default `2`).
-Everyone sharing the queue should use the same value, since `sem` enforces whatever
-limit each caller passes. A good starting point is cores / 6. If cores sit idle while
+The slot count lives in `~/.config/heavy/slots` (a single integer, default `2`). It is
+re-read on every admission check, so a change takes effect live: press `+`/`-` in
+`heavy --top` or edit the file. Shrinking never stops running jobs; new ones wait until
+fewer than N run. A good starting point is cores / 6. If cores sit idle while
 jobs wait, raise it; if load stays high, more heavy work is running outside `heavy`.
 
 ### Watchdog
 
-A hung job would hold its slot forever, so `heavy-run` (started by `heavy` once the slot
-is held) watches every job and kills it when either limit trips:
+A hung job would hold its slot forever, so `heavy-run` watches every job and kills it
+when either limit trips. Its clock starts when the job is admitted, not while it waits.
 
 - **Idle:** the job's process tree gained less than `HEAVY_IDLE_CPU` CPU-seconds
   (default `5`) over the last `HEAVY_IDLE_MIN` minutes (default `10`), and no new
   process joined the tree in that window.
-- **Wall cap:** the job has held its slot longer than `HEAVY_MAX_MIN` minutes
+- **Wall cap:** the job has run longer than `HEAVY_MAX_MIN` minutes
   (default `90`).
 
 Set a variable to `0` to disable that check; minutes may be fractional. Invalid values
@@ -146,29 +184,38 @@ Add something like this to your agent instructions (`CLAUDE.md`, `AGENTS.md`, �
 
 ## How it works
 
-`heavy` is a few lines of POSIX sh around
-`sem --id heavy -j <slots> --fg -q -u --will-cite heavy-run <cmd>`. `-q` keeps your arguments'
-quoting intact, `-u` streams output live (so it survives if the job is killed), and
-`--will-cite` skips GNU parallel's citation prompt. `sem` keeps the semaphore as lock
-files in `~/.parallel/semaphores/id-heavy/`; `heavy` pins `PARALLEL_HOME` to
-`~/.parallel` so every process run by the same user shares one queue, whatever its
-environment. A crashed holder's slot is reclaimed the next time someone acquires.
+`heavy` is a few lines of POSIX sh that exec `heavy-run`, which queues, then runs and
+supervises the command. The queue state lives in `$HEAVY_HOME` (default `~/.heavy`);
+both `heavy-run` and `heavy-top` use the same module, `heavyq.py`:
 
-`heavy-top` reads those lock files to find holders, and the process table to find
-waiters (live `sem --id heavy` processes that don't hold a slot).
+| Path | Meaning |
+|---|---|
+| `lock` | `flock` held briefly around every queue read-modify-write |
+| `slots/<i>` | a running job keeps an `flock` on one for its whole life, so the kernel frees the slot when the process dies |
+| `live/<pid>` | every `heavy-run` keeps an `flock` on its own file; an entry whose lock is free belongs to a dead process and is pruned |
+| `queue/<pid>.json` | a waiting job: command, directory, enqueue time, queue order, force/cancel flags |
+| `running/<pid>.json` | a running job: command, directory, start time, slot, forced/kill flags, last progress |
+| `paused` | exists while the queue is paused |
+
+A waiter polls every 0.5 s. Waiters are ranked by queue order (enqueue time, lowered by
+a bump), and one is admitted when its rank is below the number of free slots, so the
+queue is strict FIFO apart from bumps. `heavy-top` never signals anything: its actions
+only set flags in these files, and each job's own `heavy-run` acts on them within about
+half a second.
 
 Caveats:
 
-- The queue is per user, because the lock files live in your home directory.
-- `sem` doesn't promise first-in, first-out. Waiters poll, and whoever polls next
-  after a slot frees gets it.
+- The queue is per user, because its state lives in your home directory.
+- `$HEAVY_HOME` must be on a local filesystem; `flock` over NFS or SMB doesn't behave.
 
 ## Tests
 
 ```sh
+python3 tests/test_heavyq.py
 python3 tests/test_heavy_top.py
 python3 tests/test_heavy_run.py
-sh tests/integration_heavy_run.sh   # real binary, a few seconds
+sh tests/integration_heavy_run.sh   # watchdog, real processes, ~12 s
+sh tests/integration_queue.sh       # queue and controls, real processes, ~10 s
 ```
 
 ## License
