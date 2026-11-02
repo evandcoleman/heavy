@@ -2,6 +2,10 @@
 # Runs the real heavy-run binary with tiny limits. Takes a few seconds.
 set -u
 run="$(cd "$(dirname "$0")/.." && pwd)/bin/heavy-run"
+# heavy-run queues before it runs: use a private queue, never the developer's ~/.heavy.
+tmp=$(mktemp -d)
+export HOME="$tmp" HEAVY_HOME="$tmp/q"
+trap 'rm -rf "$tmp"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # idle kill: sleeps burn no CPU, 3s window sampled every 0.5s
