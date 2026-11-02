@@ -1,15 +1,19 @@
 #!/bin/sh
 # heavy: run a CPU-heavy command through a machine-wide queue.
-# Every caller on this host shares one counting semaphore (GNU parallel `sem`),
-# so at most N heavy commands run at once (N = slots); others block until a slot frees.
-# Output, stdin and exit code pass through unchanged.
+# Every caller on this host shares one queue in $HEAVY_HOME (default ~/.heavy), so at most
+# N heavy commands run at once (N = slots); others wait in strict FIFO order (heavy-top can
+# bump, force or cancel a waiter). Output, stdin and exit code pass through unchanged.
 #
 # Usage: heavy <cmd> [args...]
 # Status: heavy --status   (lists running holders)
-# TUI:    heavy --top      (live view of slots, holders, waiters, load; see heavy-top)
-# Slots:  ~/.config/heavy/slots (one integer), default 2. Use the same value everywhere.
+# TUI:    heavy --top      (live view and job control; see heavy-top)
+# Slots:  ~/.config/heavy/slots (one integer), default 2. Read on every admission check.
 #
-# Watchdog: once a job holds a slot, heavy-run kills it (exit 124) if its process tree
+# Exit codes: the command's own, or 124 (watchdog kill), 125 (cancelled from heavy-top
+# while waiting), 143 (killed from heavy-top), 130/143/129 (INT/TERM/HUP while waiting),
+# 2 (HEAVY_HOME unusable; the command never runs).
+#
+# Watchdog: once a job is admitted, heavy-run kills it (exit 124) if its process tree
 # gains < HEAVY_IDLE_CPU CPU-seconds (default 5) over HEAVY_IDLE_MIN minutes (default 10),
 # or if it runs past HEAVY_MAX_MIN minutes (default 90). 0 disables a check.
 # Per call: HEAVY_IDLE_MIN=0 heavy <cmd>
@@ -17,41 +21,29 @@
 set -eu
 
 SLOTS_FILE="${HOME}/.config/heavy/slots"
-
-# Pin sem's state dir so every caller shares one queue, whatever PARALLEL_HOME or
-# XDG_CACHE_HOME their environment sets. heavy-top reads the same location.
-PARALLEL_HOME="${HOME}/.parallel"
-export PARALLEL_HOME
-mkdir -p "$PARALLEL_HOME"
-SEM_ID="heavy"
-
-slots=2
-if [ -r "$SLOTS_FILE" ]; then
-  s=$(tr -dc '0-9' < "$SLOTS_FILE")
-  [ -n "$s" ] && [ "$s" -gt 0 ] && slots=$s
-fi
+HEAVY_HOME="${HEAVY_HOME:-$HOME/.heavy}"
+here="$(dirname "$(readlink -f "$0")")"
 
 if [ "${1:-}" = "--top" ]; then
   shift
-  exec "$(dirname "$(readlink -f "$0")")/heavy-top" "$@"
+  exec "$here/heavy-top" "$@"
 fi
 
 if [ "${1:-}" = "--status" ]; then
-  dir="${PARALLEL_HOME}/semaphores/id-${SEM_ID}"
-  echo "slots: $slots"
-  if [ -d "$dir" ]; then
-    for f in "$dir"/*@*; do
-      [ -e "$f" ] || continue
-      pid=${f##*/}; pid=${pid%%@*}
-      ps -o pid=,etime=,command= -p "$pid" 2>/dev/null | cut -c1-160 || true
-    done
+  slots=2
+  if [ -r "$SLOTS_FILE" ]; then
+    s=$(tr -dc '0-9' < "$SLOTS_FILE")
+    [ -n "$s" ] && [ "$s" -gt 0 ] && slots=$s
   fi
+  echo "slots: $slots"
+  for f in "$HEAVY_HOME"/running/[0-9]*.json; do
+    [ -e "$f" ] || continue
+    pid=${f##*/}; pid=${pid%.json}
+    ps -o pid=,etime=,command= -p "$pid" 2>/dev/null | cut -c1-160 || true
+  done
   exit 0
 fi
 
 [ $# -gt 0 ] || { echo "usage: heavy <cmd> [args...] | heavy --status | heavy --top" >&2; exit 2; }
 
-# -u (ungroup): stream output live and keep it if the job is killed.
-# heavy-run starts only once the slot is held, so its timers measure slot-holding time.
-exec sem --id "$SEM_ID" -j "$slots" --fg -q -u --will-cite \
-  "$(dirname "$(readlink -f "$0")")/heavy-run" "$@"
+exec "$here/heavy-run" "$@"
