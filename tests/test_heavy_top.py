@@ -172,5 +172,151 @@ class Probe(unittest.TestCase):
         self.assertEqual(snap.rows(), ())
 
 
+def two_by_two():
+    return snap_of(state(waiters=[W(3, 30.0), W(4, 40.0)], holders=[H(1, 10.0), H(2, 20.0, slot=1)],
+                         held={0, 1}))
+
+
+def ui(selected=None, **kw):
+    return ht.UiState(selected=selected, interval=kw.pop("interval", 2.0), **kw)
+
+
+class Keys(unittest.TestCase):
+    def test_decode_arrows_both_modes(self):
+        self.assertEqual(ht.decode_keys(b"\x1b[A\x1bOB\x1b[Bk"), ["up", "down", "down", "k"])
+        self.assertEqual(ht.decode_keys(b"\x1b"), ["esc"])
+        self.assertEqual(ht.decode_keys(b"\x1b[5~x"), ["x"])  # other escapes dropped
+        self.assertEqual(ht.decode_keys(b"\x1b[<64;10;5M"), [])  # mouse wheel
+        self.assertEqual(ht.decode_keys(b"+\x03"), ["+", "\x03"])
+
+    def test_selection_moves_across_running_and_waiting(self):
+        s = two_by_two()
+        u = ui(("run", 1))
+        seen = []
+        for _ in range(5):
+            u = ht.handle_key(u, "down", s).ui
+            seen.append(u.selected)
+        self.assertEqual(seen, [("run", 2), ("wait", 3), ("wait", 4), ("wait", 4), ("wait", 4)])
+        u = ht.handle_key(u, "k", s).ui
+        self.assertEqual(u.selected, ("wait", 3))
+        u = ht.handle_key(ui(None), "j", s).ui
+        self.assertEqual(u.selected, ("run", 1))
+
+    def test_key_to_action_mapping(self):
+        s = two_by_two()
+        cases = [  # (selected, key, verb or None, confirm?)
+            (("wait", 3), "f", "force", False),
+            (("wait", 3), "b", "bump", False),
+            (("wait", 3), "c", "cancel", True),
+            (("run", 1), "x", "kill", True),
+            (("run", 1), "f", None, False),
+            (("run", 1), "b", None, False),
+            (("run", 1), "c", None, False),
+            (("wait", 3), "x", None, False),
+            (None, "f", None, False),
+            (("wait", 3), "p", "pause", False),
+            (("wait", 3), "+", "slots", False),
+            (("wait", 3), "=", "slots", False),
+            (("wait", 3), "-", "slots", False),
+            (("wait", 3), "_", "slots", False),
+        ]
+        for sel, key, verb, confirm in cases:
+            r = ht.handle_key(ui(sel), key, s)
+            got = (r.ui.confirm.verb if r.ui.confirm else None) if confirm else (r.action.verb if r.action else None)
+            self.assertEqual(got, verb, (sel, key))
+            if verb is None:
+                self.assertTrue(r.ui.note, (sel, key))
+                self.assertIsNone(r.ui.confirm)
+            if confirm:
+                self.assertIsNone(r.action)
+        a = ht.handle_key(ui(("wait", 4)), "f", s).action
+        self.assertEqual((a.kind, a.pid, a.token), ("wait", 4, 40.0))
+        self.assertEqual(ht.handle_key(ui(), "+", s).action.delta, 1)
+        self.assertEqual(ht.handle_key(ui(), "-", s).action.delta, -1)
+
+    def test_kill_requires_confirm_y(self):
+        s = two_by_two()
+        r = ht.handle_key(ui(("run", 2)), "x", s)
+        self.assertEqual(r.ui.confirm.label, "kill run2? y/n")
+        r2 = ht.handle_key(r.ui, "y", s)
+        self.assertEqual((r2.action.verb, r2.action.pid, r2.action.token), ("kill", 2, 20.0))
+        self.assertIsNone(r2.ui.confirm)
+        self.assertFalse(r2.quit)
+        self.assertIn("cancel job3? y/n", ht.handle_key(ui(("wait", 3)), "c", s).ui.confirm.label)
+
+    def test_confirm_cancelled_by_other_key_including_q(self):
+        s = two_by_two()
+        asking = ht.handle_key(ui(("run", 1)), "x", s).ui
+        for key in ("n", "q", "\x03", "esc", "x"):
+            r = ht.handle_key(asking, key, s)
+            self.assertEqual((r.action, r.quit, r.ui.confirm, r.ui.note), (None, False, None, "kept"), key)
+
+    def test_quit_keys(self):
+        for key in ("q", "Q", "\x03"):
+            self.assertTrue(ht.handle_key(ui(), key, two_by_two()).quit)
+
+    def test_brackets_change_interval_plus_minus_change_slots(self):
+        s = two_by_two()
+        self.assertEqual(ht.handle_key(ui(interval=2.0), "]", s).ui.interval, 3.0)
+        self.assertEqual(ht.handle_key(ui(interval=2.0), "[", s).ui.interval, 1.0)
+        self.assertEqual(ht.handle_key(ui(interval=1.0), "[", s).ui.interval, 1.0)
+        self.assertEqual(ht.handle_key(ui(interval=30.0), "]", s).ui.interval, 30.0)
+        r = ht.handle_key(ui(interval=2.0), "+", s)
+        self.assertEqual((r.ui.interval, r.action.verb), (2.0, "slots"))
+        self.assertTrue(ht.handle_key(ui(), "r", s).refresh)
+
+
+class Reconcile(unittest.TestCase):
+    def test_reconcile_keeps_selection_by_pid_and_clamps_when_gone(self):
+        s = two_by_two()
+        self.assertEqual(ht.reconcile(ui(("wait", 4)), s).selected, ("wait", 4))
+        self.assertEqual(ht.reconcile(ui(None), s).selected, ("run", 1))
+        admitted = snap_of(state(waiters=[W(4, 40.0)], holders=[H(1, 10.0), H(2, 20.0), H(3, 50.0)]))
+        self.assertEqual(ht.reconcile(ui(("wait", 3)), admitted).selected, ("run", 3))  # follows the job
+        u = ht.reconcile(ui(("wait", 3)), s)  # remembers index 2
+        gone = snap_of(state(waiters=[W(4, 40.0)], holders=[H(1, 10.0), H(2, 20.0)]))
+        self.assertEqual(ht.reconcile(u, gone).selected, ("wait", 4))  # same index
+        u = ht.reconcile(ui(("wait", 4)), s)
+        short = snap_of(state(holders=[H(1, 10.0)]))
+        self.assertEqual(ht.reconcile(u, short).selected, ("run", 1))  # clamped to the last row
+        self.assertIsNone(ht.reconcile(u, snap_of(state())).selected)
+
+    def test_reconcile_drops_confirm_when_target_vanished(self):
+        s = two_by_two()
+        asking = ht.handle_key(ui(("run", 2)), "x", s).ui
+        self.assertIsNotNone(ht.reconcile(asking, s).confirm)
+        restarted = snap_of(state(holders=[H(1, 10.0), H(2, 99.0)]))  # pid reused: new token
+        u = ht.reconcile(asking, restarted)
+        self.assertIsNone(u.confirm)
+        self.assertEqual(u.note, "job 2 no longer running")
+
+
+class ApplyAction(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.paths = q.Paths(home=Path(tmp.name) / "q", slots_file=Path(tmp.name) / "slots")
+        self.store = q.Store(self.paths, alive=lambda pid: True)
+        self.store.ensure()
+
+    def test_apply_action_gone_sets_note(self):
+        note = ht.apply_action(self.store, ht.Action("force", "wait", 77, 1.0))
+        self.assertEqual(note, "job 77 no longer waiting")
+        note = ht.apply_action(self.store, ht.Action("kill", "run", 78, 1.0))
+        self.assertEqual(note, "job 78 no longer running")
+        self.assertEqual(os.listdir(self.paths.home / "queue"), [])
+
+    def test_apply_action_ok_mutates_store(self):
+        self.store.put_waiter(W(5, 50.0))
+        self.store.put_waiter(W(6, 60.0))
+        self.assertEqual(ht.apply_action(self.store, ht.Action("bump", "wait", 6, 60.0)), "bumped job 6 to the front")
+        self.assertEqual(self.store.get_waiter(6).order, 49.0)
+        self.assertEqual(ht.apply_action(self.store, ht.Action("force", "wait", 5, 50.0)), "forcing job 5")
+        self.assertTrue(self.store.get_waiter(5).force)
+        self.assertEqual(ht.apply_action(self.store, ht.Action("pause")), "queue paused")
+        self.assertEqual(ht.apply_action(self.store, ht.Action("pause")), "queue resumed")
+        self.assertEqual(ht.apply_action(self.store, ht.Action("slots", delta=1)), "slots: 3")
+
+
 if __name__ == "__main__":
     unittest.main()

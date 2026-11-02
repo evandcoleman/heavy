@@ -5,7 +5,9 @@ Shows slot usage, running jobs (with CPU of their whole process tree), the waiti
 queue in order, and host load. Reads $HEAVY_HOME (see heavyq.py). Stdlib only.
 
 Usage: heavy-top [--once] [--interval SECONDS]
-Keys:  q quit · r refresh now · [/] change refresh interval
+Keys:  ↑/↓ or j/k select · f force a waiter · x kill a running job (asks) · c cancel a waiter (asks)
+       b bump a waiter to the front · p pause/resume · +/- slots · [/] refresh interval
+       r refresh now · q quit
 """
 from __future__ import annotations
 
@@ -28,9 +30,10 @@ import termios
 import time
 import tty
 from collections import deque
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Iterator, Literal
 
 sys.dont_write_bytecode = True  # no __pycache__ next to the installed scripts
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -350,6 +353,168 @@ def render(snap: Snapshot, history, width: int, interval: float, color=True,
     return out if color else ANSI_RE.sub("", out)
 
 
+# ── keys and actions (pure, except apply_action) ─────────────────────────
+
+MIN_INTERVAL, MAX_INTERVAL = 1.0, 30.0
+CONFIRM_CMD_W = 60
+
+
+def decode_keys(data: bytes) -> list[str]:
+    """Bytes read from a cbreak tty -> key names. Arrows (CSI and SS3) become up/down,
+    a lone ESC "esc"; other escape sequences (paging, mouse wheel) are dropped."""
+    keys, i = [], 0
+    while i < len(data):
+        if data[i] != 0x1b:
+            ch = data[i:i + 1].decode(errors="ignore")
+            if ch:
+                keys.append(ch)
+            i += 1
+            continue
+        intro = data[i + 1:i + 2]
+        if intro == b"O" and i + 2 < len(data):
+            keys.extend({b"A": ["up"], b"B": ["down"]}.get(data[i + 2:i + 3], []))
+            i += 3
+        elif intro == b"[":
+            j = i + 2
+            while j < len(data) and not 0x40 <= data[j] <= 0x7e:
+                j += 1
+            seq = data[i:j + 1]
+            keys.extend({b"\x1b[A": ["up"], b"\x1b[B": ["down"]}.get(seq, []))
+            i = j + 1
+        else:
+            keys.append("esc")
+            i += 1
+    return keys
+
+
+@dataclass(frozen=True)
+class Action:
+    verb: Literal["force", "kill", "cancel", "bump", "pause", "slots"]
+    kind: str | None = None   # "run" | "wait" for job actions
+    pid: int | None = None
+    token: float | None = None
+    delta: int = 0
+    label: str = ""           # confirm prompt
+
+
+@dataclass(frozen=True)
+class UiState:
+    selected: tuple[str, int] | None
+    interval: float
+    confirm: Action | None = None
+    note: str = ""
+    index: int = 0  # last selected row index, to clamp to when the row vanishes
+
+
+@dataclass(frozen=True)
+class KeyResult:
+    ui: UiState
+    action: Action | None
+    quit: bool
+    refresh: bool  # re-probe now
+
+
+# key -> (verb, row kind it applies to, needs confirm)
+JOB_KEYS = {"f": ("force", "wait", False), "b": ("bump", "wait", False),
+            "c": ("cancel", "wait", True), "x": ("kill", "run", True)}
+KIND_WORD = {"wait": "waiting", "run": "running"}
+
+
+def _row(snap: Snapshot, selected) -> tuple[int, Row] | None:
+    for i, r in enumerate(snap.rows()):
+        if (r.kind, r.pid) == selected:
+            return i, r
+    return None
+
+
+def _move(ui: UiState, snap: Snapshot, step: int) -> UiState:
+    rows = snap.rows()
+    if not rows:
+        return ui
+    found = _row(snap, ui.selected)
+    i = (found[0] + step) if found else (0 if step > 0 else len(rows) - 1)
+    i = max(0, min(len(rows) - 1, i))
+    return replace(ui, selected=(rows[i].kind, rows[i].pid), index=i)
+
+
+def _job_key(ui: UiState, key: str, snap: Snapshot) -> KeyResult:
+    verb, kind, confirm = JOB_KEYS[key]
+    found = _row(snap, ui.selected)
+    if found is None:
+        return KeyResult(replace(ui, note="select a job first (↑/↓)"), None, False, False)
+    r = found[1]
+    if r.kind != kind:
+        return KeyResult(replace(ui, note=f"{key} works on {KIND_WORD[kind]} jobs"), None, False, False)
+    a = Action(verb, r.kind, r.pid, r.token, label=f"{verb} {clip(r.cmd, CONFIRM_CMD_W)}? y/n")
+    if confirm:
+        return KeyResult(replace(ui, confirm=a), None, False, False)
+    return KeyResult(ui, a, False, True)
+
+
+def handle_key(ui: UiState, key: str, snap: Snapshot) -> KeyResult:
+    if ui.confirm is not None:
+        if key == "y":
+            return KeyResult(replace(ui, confirm=None), ui.confirm, False, True)
+        return KeyResult(replace(ui, confirm=None, note="kept"), None, False, False)
+    ui = replace(ui, note="")
+    if key in ("q", "Q", "\x03"):
+        return KeyResult(ui, None, True, False)
+    if key in ("up", "k", "down", "j"):
+        return KeyResult(_move(ui, snap, -1 if key in ("up", "k") else 1), None, False, False)
+    if key in JOB_KEYS:
+        return _job_key(ui, key, snap)
+    if key == "p":
+        return KeyResult(ui, Action("pause"), False, True)
+    if key in ("+", "=", "-", "_"):
+        return KeyResult(ui, Action("slots", delta=1 if key in ("+", "=") else -1), False, True)
+    if key in ("[", "]"):
+        step = 1 if key == "]" else -1
+        interval = max(MIN_INTERVAL, min(MAX_INTERVAL, ui.interval + step))
+        return KeyResult(replace(ui, interval=interval), None, False, False)
+    return KeyResult(ui, None, False, key == "r")
+
+
+def reconcile(ui: UiState, snap: Snapshot) -> UiState:
+    """After a refresh: follow the selected job by pid (waiting -> running keeps it
+    selected), else clamp to the same index; drop a confirm whose target is gone."""
+    rows = snap.rows()
+    if ui.confirm is not None and ui.confirm.kind is not None:
+        c = ui.confirm
+        if not any((r.kind, r.pid, r.token) == (c.kind, c.pid, c.token) for r in rows):
+            ui = replace(ui, confirm=None, note=f"job {c.pid} no longer {KIND_WORD[c.kind]}")
+    if not rows:
+        return replace(ui, selected=None, index=0)
+    if ui.selected is not None:
+        for i, r in enumerate(rows):
+            if r.pid == ui.selected[1]:
+                return replace(ui, selected=(r.kind, r.pid), index=i)
+    i = min(ui.index, len(rows) - 1) if ui.selected is not None else 0
+    return replace(ui, selected=(rows[i].kind, rows[i].pid), index=i)
+
+
+DONE_NOTES = {"force": "forcing job {pid}", "cancel": "cancelling job {pid}",
+              "bump": "bumped job {pid} to the front", "kill": "killing job {pid}"}
+BUSY_NOTE = "queue busy — try again"
+
+
+def apply_action(store: heavyq.Store, a: Action) -> str:
+    """Run the heavyq control for an action; returns the footer note."""
+    if a.verb == "pause":
+        on = heavyq.toggle_pause(store)
+        return BUSY_NOTE if on == "busy" else ("queue paused" if on else "queue resumed")
+    if a.verb == "slots":
+        n = heavyq.change_slots(store, a.delta)
+        return BUSY_NOTE if n == "busy" else f"slots: {n}"
+    control = {"force": heavyq.force, "cancel": heavyq.cancel,
+               "bump": heavyq.bump, "kill": heavyq.kill}[a.verb]
+    outcome = control(store, a.pid, a.token)
+    if outcome == "busy":
+        return BUSY_NOTE
+    if outcome == "gone":
+        return f"job {a.pid} no longer {KIND_WORD[a.kind]}"
+    return DONE_NOTES[a.verb].format(pid=a.pid)
+
+
 # ── main loop ─────────────────────────────────────────────────────────────
 
 
@@ -360,12 +525,30 @@ def _exit_on_signal(*_):
     raise SystemExit(0)
 
 
+@contextmanager
+def lock_section() -> Iterator[None]:
+    """Hold off Ctrl-Z/Ctrl-C while we may hold the queue lock (a stopped TUI would stall it)."""
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTSTP, signal.SIGINT})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
+def footer_for(ui: UiState) -> str | None:
+    if ui.confirm is not None:
+        return ui.confirm.label
+    return ui.note or None
+
+
 def run_tui(store: heavyq.Store, interval: float) -> None:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     history: deque[float] = deque(maxlen=400)
     resized = [True]
     snap: Snapshot | None = None
+    ui = UiState(selected=None, interval=interval)
+    warned: set[str] = set()  # corrupt entries are reported once per session
 
     def enter():
         tty.setcbreak(fd)
@@ -387,6 +570,25 @@ def run_tui(store: heavyq.Store, interval: float) -> None:
         enter()
         resized[0] = True
 
+    def refresh(ui: UiState) -> UiState:
+        nonlocal snap
+        with lock_section():
+            snap, notes = probe(store, time.time(), snap)
+        history.append(snap.load[0])
+        fresh = [n for n in notes if n not in warned]
+        warned.update(n for n in fresh if n.startswith("dropped"))
+        ui = reconcile(ui, snap)
+        return replace(ui, note=fresh[0]) if fresh and not ui.note else ui
+
+    def draw(ui: UiState) -> None:
+        size = shutil.get_terminal_size()
+        frame = render(snap, history, size.columns, ui.interval, max_rows=size.lines,
+                       selected=ui.selected, footer=footer_for(ui))
+        clear = "\x1b[2J" if resized[0] else ""
+        resized[0] = False
+        sys.stdout.write(clear + "\x1b[H" + frame.replace("\n", "\x1b[K\n") + "\x1b[K\x1b[J")
+        sys.stdout.flush()
+
     signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
     signal.signal(signal.SIGTERM, _exit_on_signal)
     signal.signal(signal.SIGHUP, _exit_on_signal)
@@ -395,35 +597,28 @@ def run_tui(store: heavyq.Store, interval: float) -> None:
     try:
         enter()
         while True:
-            snap, notes = probe(store, time.time(), snap)
-            history.append(snap.load[0])
-            size = shutil.get_terminal_size()
-            frame = render(snap, history, size.columns, interval, max_rows=size.lines,
-                           footer=notes[0] if notes else None)
-            clear = "\x1b[2J" if resized[0] else ""
-            resized[0] = False
-            sys.stdout.write(clear + "\x1b[H" + frame.replace("\n", "\x1b[K\n") + "\x1b[K\x1b[J")
-            sys.stdout.flush()
-            deadline = time.monotonic() + interval
-            while (left := deadline - time.monotonic()) > 0:
+            ui = refresh(ui)
+            draw(ui)
+            deadline = time.monotonic() + ui.interval
+            reprobe = False
+            while not reprobe and (left := deadline - time.monotonic()) > 0:
                 r, _, _ = select.select([sys.stdin], [], [], left)
                 if not r:
                     continue
-                data = os.read(fd, 64)  # drain whole escape sequences (arrows, wheel)
+                data = os.read(fd, 64)
                 if not data:
                     return  # stdin closed
-                if len(data) > 1 and data[0] == 0x1b:
-                    continue  # ignore escape sequences
-                ch = data[:1].decode(errors="ignore")
-                if ch in {"q", "Q", "\x03"}:
-                    return
-                if ch == "]":
-                    interval = min(30.0, interval + 1)
-                elif ch == "[":
-                    interval = max(1.0, interval - 1)
-                elif ch != "r":
-                    continue
-                break
+                for key in decode_keys(data):
+                    res = handle_key(ui, key, snap)
+                    ui = res.ui
+                    if res.quit:
+                        return
+                    if res.action is not None:
+                        with lock_section():
+                            ui = replace(ui, note=apply_action(store, res.action))
+                    reprobe = reprobe or res.refresh
+                if not reprobe:
+                    draw(ui)
     except KeyboardInterrupt:
         pass
     finally:
