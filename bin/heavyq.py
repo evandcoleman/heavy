@@ -2,14 +2,36 @@
 
 State lives in $HEAVY_HOME (default ~/.heavy); the slot count in ~/.config/heavy/slots.
 Stdlib only, Python 3.10+, no terminal I/O and no process spawning.
+
+Layout of $HEAVY_HOME:
+  lock               flock held briefly around every queue read-modify-write
+  queue/<pid>.json   a waiter      running/<pid>.json   a holder
+  slots/<i>          a holder keeps flock(LOCK_EX) on one for its life; the kernel frees it on death
+  live/<pid>         every heavy-run keeps flock(LOCK_EX) on its own file for its whole life.
+                     An entry is alive only while that lock is held, so a dead or zombie
+                     process (whose fds the kernel has closed) is pruned, and pid reuse can't
+                     keep a stale entry alive.
+  paused             exists -> no new non-forced admissions
+
+Invariants:
+  * Slots are acquired only inside Store.locked(). Holders release them only by closing
+    the fd or dying. So within one lock section, held_slots() then take_slot() can't be beaten.
+  * Entry files and *.tmp files are written only inside Store.locked(), so prune may
+    delete any *.tmp it sees.
+  * Every fd this module opens is close-on-exec, so a job's children never inherit a slot.
+  * Nothing here ever signals a pid read from a state file.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import re
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Literal, Mapping, Sequence
+from typing import Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
 DEFAULT_SLOTS = 2
 POLL_SEC = 0.5
@@ -188,3 +210,224 @@ def admitted(me: Waiter, v: Verdict, now: float) -> Holder:
 def bumped(target: Waiter, waiters: Sequence[Waiter]) -> Waiter:
     lowest = min([w.order for w in waiters] + [target.order])
     return replace(target, order=lowest - 1)
+
+
+# --- store I/O -------------------------------------------------------------
+
+LOCK_RETRY_SEC = 0.01
+LIVE_RETRIES = 100
+_ENTRY_RE = re.compile(r"^([0-9]+)\.json$")
+_OPEN_FLAGS = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+
+
+class Busy(Exception):
+    """The queue lock is held by someone else past the timeout."""
+
+
+def _try_flock(fd: int) -> bool:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _is_locked_elsewhere(path: Path) -> bool | None:
+    """True if another open file holds path's flock, False if free, None if the file is missing."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    try:
+        return not _try_flock(fd)
+    finally:
+        os.close(fd)
+
+
+def _unlink_quiet(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+class Store:
+    def __init__(self, paths: Paths, *, alive: Callable[[int], bool] | None = None,
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep):
+        self.paths = paths
+        self._alive = alive or self._live_lock_held
+        self._clock = clock
+        self._sleep = sleep
+
+    # paths
+    def _dir(self, sub: str) -> Path:
+        return self.paths.home / sub
+
+    def _entry(self, sub: str, pid: int) -> Path:
+        return self._dir(sub) / f"{pid}.json"
+
+    def ensure(self) -> None:
+        for sub in ("", "queue", "running", "slots", "live"):
+            (self.paths.home / sub).mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    @contextmanager
+    def locked(self, timeout: float = 0.0) -> Iterator[None]:
+        fd = os.open(self.paths.home / "lock", _OPEN_FLAGS, 0o600)
+        try:
+            deadline = self._clock() + timeout
+            while not _try_flock(fd):
+                if self._clock() >= deadline:
+                    raise Busy(str(self.paths.home / "lock"))
+                self._sleep(LOCK_RETRY_SEC)
+            yield
+        finally:
+            os.close(fd)  # closing the last fd releases the flock
+
+    # liveness
+    def hold_live(self, pid: int) -> int:
+        """Lock live/<pid> for this process's life; returns the fd (keep it open)."""
+        path = self._dir("live") / str(pid)
+        for _ in range(LIVE_RETRIES):
+            fd = os.open(path, _OPEN_FLAGS, 0o600)
+            # A pruner may have unlinked the file between our open and flock: make sure
+            # the locked inode is still the one at path.
+            if _try_flock(fd):
+                try:
+                    if os.stat(path).st_ino == os.fstat(fd).st_ino:
+                        return fd
+                except FileNotFoundError:
+                    pass
+            os.close(fd)
+            self._sleep(LOCK_RETRY_SEC)
+        raise OSError(f"cannot lock {path}")
+
+    def _live_lock_held(self, pid: int) -> bool:
+        try:
+            return bool(_is_locked_elsewhere(self._dir("live") / str(pid)))
+        except OSError:
+            return True  # can't tell: keep the entry rather than drop a live job
+
+    # entries
+    def _entries(self, sub: str, parse) -> Iterator[tuple[Path, object | None]]:
+        """(path, entry) per entry file; entry is None when the file is corrupt."""
+        try:
+            paths = list(self._dir(sub).iterdir())
+        except FileNotFoundError:
+            return
+        for path in paths:
+            m = _ENTRY_RE.match(path.name)
+            if not m:
+                continue
+            try:
+                yield path, parse(json.loads(path.read_text()), int(m.group(1)))
+            except FileNotFoundError:
+                continue
+            except (ValueError, OSError):
+                yield path, None
+
+    def prune(self) -> list[str]:
+        """Drop dead-pid and corrupt entries and stale temp files. Call under locked()."""
+        corrupt = []
+        for sub, parse in (("queue", waiter_from_json), ("running", holder_from_json)):
+            for path in list(self._dir(sub).glob(".*.tmp")):
+                _unlink_quiet(path)
+            for path, entry in self._entries(sub, parse):
+                if entry is None:
+                    corrupt.append(f"{sub}/{path.name}")
+                    _unlink_quiet(path)
+                elif not self._alive(entry.pid):
+                    _unlink_quiet(path)
+        self._prune_live()
+        return corrupt
+
+    def _prune_live(self) -> None:
+        try:
+            names = os.listdir(self._dir("live"))
+        except FileNotFoundError:
+            return
+        for name in names:
+            path = self._dir("live") / name
+            try:
+                if _is_locked_elsewhere(path) is False:
+                    _unlink_quiet(path)
+            except OSError:
+                pass
+
+    def waiters(self) -> list[Waiter]:
+        return [e for _, e in self._entries("queue", waiter_from_json) if e is not None]
+
+    def holders(self) -> list[Holder]:
+        return [e for _, e in self._entries("running", holder_from_json) if e is not None]
+
+    def _get(self, sub: str, pid: int, parse):
+        try:
+            return parse(json.loads(self._entry(sub, pid).read_text()), pid)
+        except (OSError, ValueError):
+            return None
+
+    def get_waiter(self, pid: int) -> Waiter | None:
+        return self._get("queue", pid, waiter_from_json)
+
+    def get_holder(self, pid: int) -> Holder | None:
+        """Safe without the lock: entries are replaced by atomic rename."""
+        return self._get("running", pid, holder_from_json)
+
+    def put_waiter(self, w: Waiter) -> None:
+        atomic_write_json(self._entry("queue", w.pid), waiter_to_json(w))
+
+    def put_holder(self, h: Holder) -> None:
+        atomic_write_json(self._entry("running", h.pid), holder_to_json(h))
+
+    def drop_waiter(self, pid: int) -> None:
+        _unlink_quiet(self._entry("queue", pid))
+
+    def drop_holder(self, pid: int) -> None:
+        _unlink_quiet(self._entry("running", pid))
+
+    # queue settings
+    def paused(self) -> bool:
+        return (self.paths.home / "paused").exists()
+
+    def set_paused(self, on: bool) -> None:
+        flag = self.paths.home / "paused"
+        if on:
+            flag.touch()
+        else:
+            _unlink_quiet(flag)
+
+    def slots(self) -> int:
+        try:
+            return parse_slots(self.paths.slots_file.read_text())
+        except OSError:
+            return DEFAULT_SLOTS
+
+    def set_slots(self, n: int) -> None:
+        self.paths.slots_file.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(self.paths.slots_file, f"{max(1, n)}\n")
+
+    # slots
+    def _slot_path(self, i: int) -> Path:
+        return self._dir("slots") / str(i)
+
+    def held_slots(self, n: int) -> frozenset[int]:
+        """Indices whose flock someone holds: 0..n-1 plus any existing index >= n."""
+        extra = []
+        for name in os.listdir(self._dir("slots")):
+            if name.isdigit() and int(name) >= n:
+                extra.append(int(name))
+        held = set()
+        for i in [*range(n), *extra]:
+            path = self._slot_path(i)
+            if i < n:
+                os.close(os.open(path, _OPEN_FLAGS, 0o600))
+            if _is_locked_elsewhere(path):
+                held.add(i)
+        return frozenset(held)
+
+    def take_slot(self, i: int) -> int | None:
+        fd = os.open(self._slot_path(i), _OPEN_FLAGS, 0o600)
+        if _try_flock(fd):
+            return fd
+        os.close(fd)
+        return None

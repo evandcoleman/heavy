@@ -1,6 +1,7 @@
 """Unit tests for bin/heavyq.py: temp HEAVY_HOME, fake clock, no real sleeps or children."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sys
@@ -151,6 +152,174 @@ class Decide(unittest.TestCase):
     def test_decide_counts_me_even_if_missing_from_list(self):
         me = W(2, 20.0)
         self.assertEqual(q.decide(me, [W(1, 10.0)], 1, frozenset(), False), q.Verdict("wait", rank=1))
+
+
+class StoreCase(TempHome):
+    """A Store on a temp HEAVY_HOME with injected liveness and a fake clock."""
+
+    def setUp(self):
+        super().setUp()
+        self.t = [1000.0]
+        self.live: set[int] = set()
+        self.paths = q.Paths(home=self.tmp / "q", slots_file=self.tmp / "cfg" / "slots")
+        self.store = self.make_store(alive=lambda pid: pid in self.live)
+        self.store.ensure()
+
+    def make_store(self, **kw):
+        def sleep(sec):
+            self.t[0] += sec
+        return q.Store(self.paths, clock=lambda: self.t[0], sleep=sleep, **kw)
+
+    def hold(self, path: Path) -> int:
+        """Hold an flock on path through a separate open file description, as another process would."""
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(lambda: _close_quiet(fd))
+        return fd
+
+    def hold_slot(self, i: int) -> int:
+        return self.hold(self.paths.home / "slots" / str(i))
+
+
+def _close_quiet(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+class StoreIO(StoreCase):
+    def test_prune_removes_dead_and_corrupt_keeps_live(self):
+        self.live |= {1, 3}
+        for pid in (1, 2):
+            self.store.put_waiter(W(pid, float(pid)))
+        self.store.put_holder(H(3, 3.0))
+        self.store.put_holder(H(4, 4.0))
+        (self.paths.home / "queue" / "5.json").write_text("{not json")
+        (self.paths.home / "running" / "6.json").write_text('{"pid": 7, "cmd": "x", "started": 1}')
+        self.live |= {5, 6}
+        corrupt = self.store.prune()
+        self.assertEqual(sorted(corrupt), ["queue/5.json", "running/6.json"])
+        self.assertEqual([w.pid for w in self.store.waiters()], [1])
+        self.assertEqual([h.pid for h in self.store.holders()], [3])
+
+    def test_prune_removes_stale_tmp_files(self):
+        for d in ("queue", "running"):
+            (self.paths.home / d / ".1.json.99.tmp").write_text("{}")
+        self.store.prune()
+        self.assertEqual(os.listdir(self.paths.home / "queue"), [])
+        self.assertEqual(os.listdir(self.paths.home / "running"), [])
+
+    def test_reader_tolerates_entry_vanishing_mid_listdir(self):
+        self.live |= {1, 2}
+        self.store.put_waiter(W(1, 1.0))
+        self.store.put_waiter(W(2, 2.0))
+        qdir = self.paths.home / "queue"
+        real = Path.iterdir
+
+        def iterdir(path):
+            items = list(real(path))
+            if path == qdir:
+                os.unlink(qdir / "1.json")
+            return iter(items)
+
+        Path.iterdir = iterdir
+        try:
+            got = self.store.waiters()
+        finally:
+            Path.iterdir = real
+        self.assertEqual([w.pid for w in got], [2])
+
+    def test_held_slots_sees_other_holder_and_does_not_disturb_it(self):
+        fd = self.hold_slot(0)
+        self.assertEqual(self.store.held_slots(2), frozenset({0}))
+        with self.assertRaises(BlockingIOError):  # still held by the test's fd
+            fcntl.flock(os.open(self.paths.home / "slots" / "0", os.O_RDWR | os.O_CLOEXEC),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.close(fd)
+        self.assertEqual(self.store.held_slots(2), frozenset())
+
+    def test_held_slots_counts_held_index_beyond_n(self):
+        self.hold_slot(3)
+        (self.paths.home / "slots" / "4").write_text("")  # free, beyond n
+        self.assertEqual(self.store.held_slots(2), frozenset({3}))
+
+    def test_take_slot_fd_not_inheritable(self):
+        fd = self.store.take_slot(0)
+        self.addCleanup(os.close, fd)
+        self.assertIsNotNone(fd)
+        self.assertFalse(os.get_inheritable(fd))
+        self.assertIsNone(self.store.take_slot(0))  # second open file description conflicts
+        self.assertEqual(self.store.held_slots(1), frozenset({0}))
+
+    def test_locked_raises_busy_when_held_elsewhere(self):
+        self.hold(self.paths.home / "lock")
+        start = self.t[0]
+        with self.assertRaises(q.Busy):
+            with self.store.locked(timeout=1.0):
+                self.fail("entered a held lock")
+        self.assertGreaterEqual(self.t[0] - start, 1.0)
+        with self.assertRaises(q.Busy):
+            with self.store.locked():
+                pass
+
+    def test_locked_is_reacquirable(self):
+        with self.store.locked():
+            pass
+        with self.store.locked():
+            pass
+
+    def test_ensure_fails_on_uncreatable_home(self):
+        f = self.tmp / "file"
+        f.write_text("")
+        s = q.Store(q.Paths(home=f / "sub", slots_file=self.tmp / "s"))
+        with self.assertRaises(OSError):
+            s.ensure()
+
+    def test_set_slots_min_one_and_atomic(self):
+        self.assertEqual(self.store.slots(), q.DEFAULT_SLOTS)
+        self.store.set_slots(0)
+        self.assertEqual(self.store.slots(), 1)
+        self.store.set_slots(5)
+        self.assertEqual(self.paths.slots_file.read_text().strip(), "5")
+        self.assertEqual(sorted(os.listdir(self.paths.slots_file.parent)), ["slots"])
+
+    def test_paused_toggle(self):
+        self.assertFalse(self.store.paused())
+        self.store.set_paused(True)
+        self.assertTrue(self.store.paused())
+        self.store.set_paused(False)
+        self.assertFalse(self.store.paused())
+
+
+class LiveLocks(StoreCase):
+    """Default liveness (R1): an entry is alive while live/<pid> is flocked."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = self.make_store()
+
+    def test_entry_alive_only_while_live_file_locked(self):
+        self.store.put_waiter(W(1, 1.0))
+        self.store.put_waiter(W(2, 2.0))
+        self.store.put_holder(H(3, 3.0))
+        fd1 = self.hold(self.paths.home / "live" / "1")
+        (self.paths.home / "live" / "2").write_text("")  # exists but nobody holds it (zombie/dead)
+        self.store.prune()
+        self.assertEqual([w.pid for w in self.store.waiters()], [1])
+        self.assertEqual(self.store.holders(), [])  # live/3 missing
+        self.assertEqual(os.listdir(self.paths.home / "live"), ["1"])  # stale live/2 removed
+        os.close(fd1)
+        self.store.prune()
+        self.assertEqual(self.store.waiters(), [])
+
+    def test_hold_live_marks_alive_and_is_cloexec(self):
+        fd = self.store.hold_live(42)
+        self.addCleanup(os.close, fd)
+        self.assertFalse(os.get_inheritable(fd))
+        self.store.put_waiter(W(42, 1.0))
+        self.store.prune()
+        self.assertEqual([w.pid for w in self.store.waiters()], [42])
 
 
 if __name__ == "__main__":
