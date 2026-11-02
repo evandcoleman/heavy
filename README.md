@@ -60,7 +60,7 @@ brew install parallel            # or: apt install parallel
 curl -fsSL https://raw.githubusercontent.com/evandcoleman/heavy/main/install.sh | sh
 ```
 
-That puts `heavy` and `heavy-top` in `~/.local/bin`. Set `PREFIX` to install
+That puts `heavy`, `heavy-top` and `heavy-run` in `~/.local/bin`. Set `PREFIX` to install
 somewhere else (`â€¦ | PREFIX=~/tools sh` installs to `~/tools/bin`), or `HEAVY_REF` to pin a tag or commit.
 
 From a clone:
@@ -95,6 +95,28 @@ Everyone sharing the queue should use the same value, since `sem` enforces whate
 limit each caller passes. A good starting point is cores / 6. If cores sit idle while
 jobs wait, raise it; if load stays high, more heavy work is running outside `heavy`.
 
+### Watchdog
+
+A hung job would hold its slot forever, so `heavy-run` (started by `heavy` once the slot
+is held) watches every job and kills it when either limit trips:
+
+- **Idle:** the job's process tree gained less than `HEAVY_IDLE_CPU` CPU-seconds
+  (default `5`) over the last `HEAVY_IDLE_MIN` minutes (default `10`).
+- **Wall cap:** the job has held its slot longer than `HEAVY_MAX_MIN` minutes
+  (default `90`).
+
+Set a variable to `0` to disable that check; minutes may be fractional. Invalid values
+warn on stderr and fall back to the default. Per call: `HEAVY_IDLE_MIN=0 heavy <cmd>`.
+`HEAVY_SAMPLE_SEC` (default `30`) is the sampling interval, for tests and tuning only.
+
+A kill sends SIGTERM to the job's process group and tracked descendants, SIGKILL after
+10s, prints one line to stderr naming the limit that tripped, and exits `124`. Otherwise
+the exit code is the job's own (`128+signal` if it died by signal).
+
+Caveat: the job tree is the launcher's descendants plus its process group. A process
+reparented to init/launchd outside that group (for example a macOS XCTest app host) is
+neither counted nor killed directly; the watchdog judges by the launcher's tree.
+
 ### Watching from another machine
 
 ```sh
@@ -119,7 +141,7 @@ Add something like this to your agent instructions (`CLAUDE.md`, `AGENTS.md`, â€
 ## How it works
 
 `heavy` is a few lines of POSIX sh around
-`sem --id heavy -j <slots> --fg -q -u --will-cite <cmd>`. `-q` keeps your arguments'
+`sem --id heavy -j <slots> --fg -q -u --will-cite heavy-run <cmd>`. `-q` keeps your arguments'
 quoting intact, `-u` streams output live (so it survives if the job is killed), and
 `--will-cite` skips GNU parallel's citation prompt. `sem` keeps the semaphore as lock
 files in `~/.parallel/semaphores/id-heavy/`; `heavy` pins `PARALLEL_HOME` to
@@ -139,6 +161,8 @@ Caveats:
 
 ```sh
 python3 tests/test_heavy_top.py
+python3 tests/test_heavy_run.py
+sh tests/integration_heavy_run.sh   # real binary, a few seconds
 ```
 
 ## License

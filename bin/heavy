@@ -8,6 +8,11 @@
 # Status: heavy --status   (lists running holders)
 # TUI:    heavy --top      (live view of slots, holders, waiters, load; see heavy-top)
 # Slots:  ~/.config/heavy/slots (one integer), default 2. Use the same value everywhere.
+#
+# Watchdog: once a job holds a slot, heavy-run kills it (exit 124) if its process tree
+# gains < HEAVY_IDLE_CPU CPU-seconds (default 5) over HEAVY_IDLE_MIN minutes (default 10),
+# or if it runs past HEAVY_MAX_MIN minutes (default 90). 0 disables a check.
+# Per call: HEAVY_IDLE_MIN=0 heavy <cmd>
 
 set -eu
 
@@ -47,4 +52,6 @@ fi
 [ $# -gt 0 ] || { echo "usage: heavy <cmd> [args...] | heavy --status | heavy --top" >&2; exit 2; }
 
 # -u (ungroup): stream output live and keep it if the job is killed.
-exec sem --id "$SEM_ID" -j "$slots" --fg -q -u --will-cite "$@"
+# heavy-run starts only once the slot is held, so its timers measure slot-holding time.
+exec sem --id "$SEM_ID" -j "$slots" --fg -q -u --will-cite \
+  "$(dirname "$(readlink -f "$0")")/heavy-run" "$@"

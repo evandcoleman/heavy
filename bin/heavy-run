@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""heavy-run: run a command and kill it if it hangs. Started by `heavy` once a slot is held.
+
+Passes stdio and the exit code through. Every sample interval it sums the CPU time of
+the job's process tree (descendants of the child plus its process group). It kills the
+job when the tree gains too little CPU over a trailing window (idle) or when the job
+runs past a wall-clock cap. Exit 124 on a kill.
+
+Env (minutes may be fractional; 0 disables the check):
+  HEAVY_IDLE_MIN   idle window in minutes, default 10
+  HEAVY_IDLE_CPU   CPU-seconds the tree must gain per window, default 5
+  HEAVY_MAX_MIN    wall cap in minutes, default 90
+  HEAVY_SAMPLE_SEC sample interval in seconds, default 30 (test/tuning only)
+
+Stdlib only, Python 3.10+.
+"""
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Callable, Mapping, Optional
+
+KILL_EXIT = 124
+TERM_GRACE_SEC = 10.0
+FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+# --- parsing ---------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Proc:
+    pid: int
+    ppid: int
+    pgid: int
+    cpu: float
+
+
+def parse_cpu_time(s: str) -> Optional[float]:
+    """Parse ps TIME: [[dd-]hh:]mm:ss[.cc] -> seconds, or None if malformed."""
+    try:
+        days = 0
+        if "-" in s:
+            d, s = s.split("-", 1)
+            days = int(d)
+        parts = s.split(":")
+        if not 2 <= len(parts) <= 3:
+            return None
+        secs = float(parts[-1])
+        for unit, p in zip((60, 3600), reversed(parts[:-1])):
+            secs += int(p) * unit
+        return days * 86400 + secs
+    except ValueError:
+        return None
+
+
+def parse_ps(text: str) -> list[Proc]:
+    """Parse `ps -axo pid=,ppid=,pgid=,time=` output, skipping malformed rows."""
+    procs = []
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) != 4:
+            continue
+        cpu = parse_cpu_time(f[3])
+        try:
+            pid, ppid, pgid = int(f[0]), int(f[1]), int(f[2])
+        except ValueError:
+            continue
+        if cpu is not None:
+            procs.append(Proc(pid, ppid, pgid, cpu))
+    return procs
+
+
+def select_tree(procs: list[Proc], root: int, pgid: int) -> dict[int, float]:
+    """pid -> cpu for descendants of root (by ppid) plus every member of group pgid."""
+    children: dict[int, list[int]] = {}
+    for p in procs:
+        children.setdefault(p.ppid, []).append(p.pid)
+    tree = {root}
+    stack = [root]
+    while stack:
+        for c in children.get(stack.pop(), ()):
+            if c not in tree:
+                tree.add(c)
+                stack.append(c)
+    tree.update(p.pid for p in procs if p.pgid == pgid)
+    return {p.pid: p.cpu for p in procs if p.pid in tree}
+
+
+# --- config ----------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Config:
+    idle_cpu: float
+    idle_min: float
+    max_min: float
+    sample_sec: float
+
+
+def _env_number(env: Mapping[str, str], name: str, default: float, warn: Callable[[str], None],
+                allow_zero: bool = True) -> float:
+    raw = env.get(name)
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+        if not math.isfinite(v) or v < 0 or (v == 0 and not allow_zero):
+            raise ValueError
+    except ValueError:
+        warn(f"heavy: invalid {name}={raw!r}; using default {default:g}")
+        return default
+    return v
+
+
+def load_config(env: Mapping[str, str], warn: Callable[[str], None]) -> Config:
+    return Config(
+        idle_cpu=_env_number(env, "HEAVY_IDLE_CPU", 5.0, warn),
+        idle_min=_env_number(env, "HEAVY_IDLE_MIN", 10.0, warn),
+        max_min=_env_number(env, "HEAVY_MAX_MIN", 90.0, warn),
+        sample_sec=_env_number(env, "HEAVY_SAMPLE_SEC", 30.0, warn, allow_zero=False),
+    )
+
+
+# --- decision logic --------------------------------------------------------
+
+@dataclass(frozen=True)
+class Decision:
+    kind: str  # "continue" | "idle" | "wallcap"
+    cpu: float = 0.0  # CPU gained over the window (idle only)
+
+
+class Watchdog:
+    """Pure decision logic: feed (timestamp, per-pid cpu) samples, get a Decision."""
+
+    def __init__(self, idle_cpu: float, idle_sec: float, max_sec: float, start: float):
+        self._idle_cpu, self._idle_sec, self._max_sec, self._start = idle_cpu, idle_sec, max_sec, start
+        self._high: dict[int, float] = {}
+        self._history: deque[tuple[float, float]] = deque([(start, 0.0)])
+
+    def observe(self, now: float, samples: Optional[Mapping[int, float]]) -> Decision:
+        """samples=None means the sample failed: only the wall cap is judged."""
+        if self._max_sec > 0 and now - self._start > self._max_sec:
+            return Decision("wallcap")
+        if samples is None:
+            return Decision("continue")
+        for pid, cpu in samples.items():
+            self._high[pid] = max(self._high.get(pid, 0.0), cpu)
+        total = sum(self._high.values())
+        self._history.append((now, total))
+        if self._idle_sec <= 0 or now - self._start < self._idle_sec:
+            return Decision("continue")
+        cutoff = now - self._idle_sec
+        while len(self._history) > 1 and self._history[1][0] <= cutoff:
+            self._history.popleft()
+        gain = total - self._history[0][1]
+        if gain < self._idle_cpu:
+            return Decision("idle", cpu=gain)
+        return Decision("continue")
+
+
+def kill_message(d: Decision, cfg: Config) -> str:
+    if d.kind == "wallcap":
+        return (f"heavy: killed job at wall cap (HEAVY_MAX_MIN={cfg.max_min:g}m)"
+                " — override per call: HEAVY_MAX_MIN=0 heavy <cmd>")
+    return (f"heavy: killed idle job ({d.cpu:.1f}s CPU in last {cfg.idle_min:g}m; "
+            f"limit HEAVY_IDLE_CPU={cfg.idle_cpu:g}s/HEAVY_IDLE_MIN={cfg.idle_min:g}m)"
+            " — override per call: HEAVY_IDLE_MIN=0 heavy <cmd>")
+
+
+# --- I/O loop --------------------------------------------------------------
+
+def supervise(cfg: Config, *, clock: Callable[[], float], wait_exit: Callable[[float], Optional[int]],
+              sampler: Callable[[], Optional[Mapping[int, float]]], kill: Callable[[], None]):
+    """Poll until the child exits or the watchdog fires.
+
+    wait_exit(sec) blocks up to sec and returns the child's exit code, or None if still
+    running. Returns ("exit", code) or ("killed", message) after calling kill().
+    """
+    dog = Watchdog(cfg.idle_cpu, cfg.idle_min * 60, cfg.max_min * 60, clock())
+    while True:
+        code = wait_exit(cfg.sample_sec)
+        if code is not None:
+            return "exit", code
+        d = dog.observe(clock(), sampler())
+        if d.kind != "continue":
+            kill()
+            return "killed", kill_message(d, cfg)
+
+
+# --- real process plumbing -------------------------------------------------
+
+def ps_sampler(root: int, pgid: int, run=subprocess.run) -> Callable[[], Optional[dict[int, float]]]:
+    last: dict[int, float] = {}
+
+    def sample() -> Optional[dict[int, float]]:
+        try:
+            r = run(["ps", "-axo", "pid=,ppid=,pgid=,time="], capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            return None
+        tree = select_tree(parse_ps(r.stdout), root, pgid)
+        last.clear()
+        last.update(tree)
+        return tree
+
+    sample.last_pids = last  # type: ignore[attr-defined]
+    return sample
+
+
+def _signal_all(sig: int, pgid: int, pids) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except OSError:
+        pass
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
+def kill_tree(proc: subprocess.Popen, pgid: int, pids, grace: float = TERM_GRACE_SEC) -> None:
+    """SIGTERM the group and tracked pids; SIGKILL whatever survives the grace period."""
+    pids = [p for p in pids if p != os.getpid()]
+    _signal_all(signal.SIGTERM, pgid, pids)
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_all(signal.SIGKILL, pgid, pids)  # group may hold stragglers even if the child exited
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def exit_code(returncode: int) -> int:
+    return 128 - returncode if returncode < 0 else returncode
+
+
+def main(argv: list[str], env: Mapping[str, str] = os.environ) -> int:
+    if not argv:
+        print("usage: heavy-run <cmd> [args...]", file=sys.stderr)
+        return 2
+    warn = lambda m: print(m, file=sys.stderr)
+    cfg = load_config(env, warn)
+    try:
+        proc = subprocess.Popen(argv, preexec_fn=os.setpgrp)
+    except OSError as e:
+        print(f"heavy-run: {argv[0]}: {e.strerror}", file=sys.stderr)
+        return 127 if isinstance(e, FileNotFoundError) else 126
+    pgid = proc.pid
+    for sig in FORWARDED_SIGNALS:
+        signal.signal(sig, lambda s, _f: _signal_all(s, pgid, ()))
+
+    def wait_exit(sec: float) -> Optional[int]:
+        try:
+            return proc.wait(timeout=sec)
+        except subprocess.TimeoutExpired:
+            return None
+
+    sampler = ps_sampler(proc.pid, pgid)
+    kind, value = supervise(
+        cfg, clock=time.monotonic, wait_exit=wait_exit, sampler=sampler,
+        kill=lambda: kill_tree(proc, pgid, list(sampler.last_pids)),
+    )
+    if kind == "killed":
+        print(value, file=sys.stderr)
+        return KILL_EXIT
+    return exit_code(value)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

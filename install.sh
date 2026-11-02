@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install heavy and heavy-top into $PREFIX/bin (default ~/.local/bin).
+# Install heavy, heavy-top and heavy-run into $PREFIX/bin (default ~/.local/bin).
 #
 # One line:   curl -fsSL https://raw.githubusercontent.com/evandcoleman/heavy/main/install.sh | sh
 # From a clone:
@@ -27,7 +27,7 @@ main() {
     exit 1
   }
   command -v python3 >/dev/null 2>&1 ||
-    echo "note: heavy-top needs python3 (3.10+); heavy itself does not." >&2
+    echo "note: heavy-top and heavy-run need python3 (3.10+)." >&2
 
   # Run from a checkout? Use its bin/. Piped from curl? Download into a temp dir.
   # ($0 is "sh" when piped, so only trust it when it names this script.)
@@ -35,7 +35,7 @@ main() {
   case "$(basename -- "$0")" in
     install.sh) here="$(cd "$(dirname -- "$0")" && pwd)" ;;
   esac
-  if [ -n "$here" ] && [ -f "$here/bin/heavy" ] && [ -f "$here/bin/heavy-top" ]; then
+  if [ -n "$here" ] && [ -f "$here/bin/heavy" ] && [ -f "$here/bin/heavy-top" ] && [ -f "$here/bin/heavy-run" ]; then
     src="$here/bin"
   else
     [ "$mode" = "--link" ] && { echo "--link needs a git checkout" >&2; exit 2; }
@@ -43,14 +43,14 @@ main() {
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
     base="https://raw.githubusercontent.com/$REPO/${HEAVY_REF:-main}/bin"
-    for f in heavy heavy-top; do
+    for f in heavy heavy-top heavy-run; do
       curl -fsSL "$base/$f" -o "$tmp/$f"
     done
     src="$tmp"
   fi
 
   mkdir -p "$bin"
-  for f in heavy heavy-top; do
+  for f in heavy heavy-top heavy-run; do
     rm -f "$bin/$f" # also clears a previous --link symlink, which cp would follow
     if [ "$mode" = "--link" ]; then
       ln -s "$src/$f" "$bin/$f"
@@ -59,7 +59,7 @@ main() {
       chmod 755 "$bin/$f"
     fi
   done
-  echo "installed heavy, heavy-top -> $bin"
+  echo "installed heavy, heavy-top, heavy-run -> $bin"
   case ":$PATH:" in *":$bin:"*) ;; *) echo "add $bin to your PATH" ;; esac
 }
 

@@ -18,9 +18,13 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = macOS ]; then brew install parallel; else sudo apt-get update && sudo apt-get install -y parallel; fi
       - name: Unit tests
-        run: python3 tests/test_heavy_top.py
+        run: |
+          python3 tests/test_heavy_top.py
+          python3 tests/test_heavy_run.py
+      - name: Watchdog integration test
+        run: sh tests/integration_heavy_run.sh
       - name: Shell syntax
-        run: sh -n bin/heavy && sh -n install.sh
+        run: sh -n bin/heavy && sh -n install.sh && sh -n tests/integration_heavy_run.sh
       - name: Smoke test
         run: |
           ./install.sh
@@ -34,4 +38,5 @@ jobs:
             | HEAVY_REF=${{ github.sha }} PREFIX="$RUNNER_TEMP/pipe" sh
           cmp "$RUNNER_TEMP/pipe/bin/heavy" bin/heavy
           cmp "$RUNNER_TEMP/pipe/bin/heavy-top" bin/heavy-top
+          cmp "$RUNNER_TEMP/pipe/bin/heavy-run" bin/heavy-run
           "$RUNNER_TEMP/pipe/bin/heavy" true
