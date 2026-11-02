@@ -254,11 +254,13 @@ def _unlink_quiet(path: Path) -> None:
 class Store:
     def __init__(self, paths: Paths, *, alive: Callable[[int], bool] | None = None,
                  clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 live_probe_hook: Callable[[Path], None] = lambda path: None):
         self.paths = paths
         self._alive = alive or self._live_lock_held
         self._clock = clock
         self._sleep = sleep
+        self._live_probe_hook = live_probe_hook  # test seam: runs between probe and unlink
 
     # paths
     def _dir(self, sub: str) -> Path:
@@ -289,18 +291,26 @@ class Store:
         """Lock live/<pid> for this process's life; returns the fd (keep it open)."""
         path = self._dir("live") / str(pid)
         for _ in range(LIVE_RETRIES):
-            fd = os.open(path, _OPEN_FLAGS, 0o600)
-            # A pruner may have unlinked the file between our open and flock: make sure
-            # the locked inode is still the one at path.
-            if _try_flock(fd):
-                try:
-                    if os.stat(path).st_ino == os.fstat(fd).st_ino:
-                        return fd
-                except FileNotFoundError:
-                    pass
-            os.close(fd)
+            fd = self.try_hold_live(path)
+            if fd is not None:
+                return fd
             self._sleep(LOCK_RETRY_SEC)
         raise OSError(f"cannot lock {path}")
+
+    @staticmethod
+    def try_hold_live(path: Path) -> int | None:
+        """One attempt of hold_live: the locked fd, or None if busy or the file was replaced."""
+        fd = os.open(path, _OPEN_FLAGS, 0o600)
+        # A pruner may have unlinked the file between our open and flock: make sure
+        # the locked inode is still the one at path.
+        if _try_flock(fd):
+            try:
+                if os.stat(path).st_ino == os.fstat(fd).st_ino:
+                    return fd
+            except FileNotFoundError:
+                pass
+        os.close(fd)
+        return None
 
     def _live_lock_held(self, pid: int) -> bool:
         try:
@@ -349,10 +359,20 @@ class Store:
         for name in names:
             path = self._dir("live") / name
             try:
-                if _is_locked_elsewhere(path) is False:
+                fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+            except OSError:
+                continue
+            try:
+                # Unlink while still holding the probe lock: a new owner can't lock this
+                # inode until we close, and by then it's gone from path, so hold_live's
+                # inode check makes the owner retry on a fresh file.
+                if _try_flock(fd):
+                    self._live_probe_hook(path)
                     _unlink_quiet(path)
             except OSError:
                 pass
+            finally:
+                os.close(fd)
 
     def waiters(self) -> list[Waiter]:
         return [e for _, e in self._entries("queue", waiter_from_json) if e is not None]

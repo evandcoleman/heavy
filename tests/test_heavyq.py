@@ -313,6 +313,27 @@ class LiveLocks(StoreCase):
         self.store.prune()
         self.assertEqual(self.store.waiters(), [])
 
+    def test_prune_cannot_orphan_a_new_live_owner(self):
+        """A new owner that locks live/<pid> between prune's probe and its unlink must not
+        end up holding an unlinked inode (its entries would then be pruned as dead)."""
+        live = self.paths.home / "live" / "7"
+        live.write_text("")  # stale: nobody holds it
+        owner: list[int | None] = []
+
+        def new_owner_arrives(path):
+            if path == live and not owner:
+                owner.append(q.Store.try_hold_live(path))
+
+        store = self.make_store(live_probe_hook=new_owner_arrives)
+        store.prune()
+        self.assertEqual(len(owner), 1)
+        fd = owner[0] if owner[0] is not None else store.hold_live(7)
+        self.addCleanup(os.close, fd)
+        store.put_waiter(W(7, 1.0))
+        store.prune()
+        self.assertEqual([w.pid for w in store.waiters()], [7])
+        self.assertEqual(os.stat(live).st_ino, os.fstat(fd).st_ino)
+
     def test_hold_live_marks_alive_and_is_cloexec(self):
         fd = self.store.hold_live(42)
         self.addCleanup(os.close, fd)
